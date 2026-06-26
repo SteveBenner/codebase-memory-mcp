@@ -59,6 +59,10 @@ extern void suite_repro_issue581(void);
 extern void suite_repro_new_ts_class_field_arrow(void);
 extern void suite_repro_new_py_tuple_unpack(void);
 extern void suite_repro_new_cypher_limit_zero(void);
+/* Large INVARIANT test group (graph-quality systemic invariants, QUALITY_ANALYSIS) */
+extern void suite_repro_invariant_calls(void);
+extern void suite_repro_invariant_graph(void);
+extern void suite_repro_invariant_breadth(void);
 
 int main(void) {
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
@@ -104,6 +108,9 @@ int main(void) {
     RUN_SUITE(repro_new_cypher_limit_zero);
     RUN_SUITE(repro_issue363);
     RUN_SUITE(repro_issue581);
+    RUN_SUITE(repro_invariant_calls);
+    RUN_SUITE(repro_invariant_graph);
+    RUN_SUITE(repro_invariant_breadth);
 
     TEST_SUMMARY();
 }
