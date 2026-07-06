@@ -72,9 +72,14 @@ function buildFixture(overrides: FixtureOverrides = {}): Fixture {
   const nameOffs = names.map(addString);
   const pathOffs = paths.map(addString);
   const qnOffs = [0, 0, 0];
+  /* v3 per-node metadata */
+  const inCalls = [0, 7, 2];
+  const startLines = [1, 40, 0];
+  const endLines = [9, 80, 0];
+  const statusIds = [0, 5, 6]; /* dead, normal, structural */
   const stringsSize = stringBytes.length;
 
-  const unpadded = 32 + n * 8 + e * 8 + n * 12 + n * 4 * 5 + n + e;
+  const unpadded = 32 + n * 8 + e * 8 + n * 12 + n * 4 * 8 + n * 2 + e;
   const padded = (unpadded + 3) & ~3;
   const total =
     padded + labels.length * 4 + etypes.length * 4 + stringsSize;
@@ -82,7 +87,7 @@ function buildFixture(overrides: FixtureOverrides = {}): Fixture {
   const buf = new ArrayBuffer(total);
   const dv = new DataView(buf);
   dv.setUint32(0, MAGIC, true);
-  dv.setUint32(4, overrides.version ?? 2, true);
+  dv.setUint32(4, overrides.version ?? 3, true);
   dv.setUint32(8, n, true);
   dv.setUint32(12, e, true);
   dv.setUint32(16, n, true); /* totalNodes */
@@ -130,7 +135,23 @@ function buildFixture(overrides: FixtureOverrides = {}): Fixture {
     dv.setUint32(p, off, true);
     p += 4;
   }
+  for (const v of inCalls) {
+    dv.setUint32(p, v, true);
+    p += 4;
+  }
+  for (const v of startLines) {
+    dv.setUint32(p, v, true);
+    p += 4;
+  }
+  for (const v of endLines) {
+    dv.setUint32(p, v, true);
+    p += 4;
+  }
   for (const id of nodeLabelIds) {
+    dv.setUint8(p, id);
+    p += 1;
+  }
+  for (const id of statusIds) {
     dv.setUint8(p, id);
     p += 1;
   }
@@ -236,12 +257,30 @@ describe("parseLayoutBinary (v2)", () => {
     expect(view.indexOfId(999)).toBe(-1);
   });
 
-  it("rejects non-v2 versions", () => {
+  it("exposes v3 per-node metadata (status/in_calls/lines)", () => {
+    const fx = buildFixture();
+    const view = parseLayoutBinary(fx.buf);
+    expect(Array.from(view.inCalls)).toEqual([0, 7, 2]);
+    expect(Array.from(view.startLines)).toEqual([1, 40, 0]);
+    expect(Array.from(view.endLines)).toEqual([9, 80, 0]);
+    expect(view.getStatus(0)).toBe("dead");
+    expect(view.getStatus(1)).toBe("normal");
+    expect(view.getStatus(2)).toBe("structural");
+    const n0 = view.nodeAt(0);
+    expect(n0.status).toBe("dead");
+    expect(n0.in_calls).toBe(0);
+    expect(n0.start_line).toBe(1);
+    expect(n0.end_line).toBe(9);
+    /* line 0 = unknown -> undefined on the node object */
+    expect(view.nodeAt(2).start_line).toBeUndefined();
+  });
+
+  it("rejects non-v3 versions", () => {
     expect(() => parseLayoutBinary(buildFixture({ version: 1 }).buf)).toThrow(
       /version 1/,
     );
-    expect(() => parseLayoutBinary(buildFixture({ version: 3 }).buf)).toThrow(
-      /version 3/,
+    expect(() => parseLayoutBinary(buildFixture({ version: 2 }).buf)).toThrow(
+      /version 2/,
     );
   });
 

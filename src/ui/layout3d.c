@@ -928,6 +928,20 @@ static int small_intern(const char **arr, uint8_t *count, const char *s) {
     return (*count)++;
 }
 
+/* Status string -> wire enum. Order is pinned in the v3 format doc
+ * (layout3d.h); the TS parser mirrors it. Unknown/NULL maps to normal. */
+static uint8_t status_wire_id(const char *status) {
+    static const char *names[] = {"dead",     "single", "entry",     "test",
+                                  "exported", "normal", "structural"};
+    if (!status)
+        return 5; /* normal */
+    for (uint8_t i = 0; i < 7; i++) {
+        if (strcmp(status, names[i]) == 0)
+            return i;
+    }
+    return 5;
+}
+
 void *cbm_layout_to_binary(const cbm_layout_result_t *r, size_t *out_size) {
     if (!r || !out_size)
         return NULL;
@@ -1007,13 +1021,17 @@ void *cbm_layout_to_binary(const cbm_layout_result_t *r, size_t *out_size) {
     size_t sec_name_off = (size_t)n * 4;
     size_t sec_path_off = (size_t)n * 4;
     size_t sec_qn_off = (size_t)n * 4;
+    size_t sec_in_calls = (size_t)n * 4;   /* v3 */
+    size_t sec_start_line = (size_t)n * 4; /* v3 */
+    size_t sec_end_line = (size_t)n * 4;   /* v3 */
     size_t sec_node_lbl = (size_t)n;
+    size_t sec_node_status = (size_t)n; /* v3 */
     size_t sec_edge_etype = (size_t)e;
     /* The u8 sections (node_lbl + edge_etype) end at an arbitrary byte; the
      * following u32 sections require 4-byte alignment. Insert a pad so the
      * frontend can wrap the strings tables as Uint32Array views directly. */
     size_t pre_u32_pad =
-        (4 - ((sec_node_lbl + sec_edge_etype) & 3u)) & 3u;
+        (4 - ((sec_node_lbl + sec_node_status + sec_edge_etype) & 3u)) & 3u;
     size_t sec_label_idx = (size_t)labels_ct * 4;
     size_t sec_etype_idx = (size_t)etypes_ct * 4;
     size_t sec_strings = it.len;
@@ -1023,8 +1041,9 @@ void *cbm_layout_to_binary(const cbm_layout_result_t *r, size_t *out_size) {
 
     size_t total =
         header_size + sec_node_ids + sec_edge_src + sec_edge_tgt + sec_positions + sec_sizes +
-        sec_colors + sec_name_off + sec_path_off + sec_qn_off + sec_node_lbl + sec_edge_etype +
-        pre_u32_pad + sec_label_idx + sec_etype_idx + strings_padded;
+        sec_colors + sec_name_off + sec_path_off + sec_qn_off + sec_in_calls + sec_start_line +
+        sec_end_line + sec_node_lbl + sec_node_status + sec_edge_etype + pre_u32_pad +
+        sec_label_idx + sec_etype_idx + strings_padded;
 
     uint8_t *buf = malloc(total);
     if (!buf) {
@@ -1047,7 +1066,7 @@ void *cbm_layout_to_binary(const cbm_layout_result_t *r, size_t *out_size) {
         memcpy((P), &_v, 4);                                                                       \
     } while (0)
     WRITE_U32(p + 0, 0x4C414233u); /* 'LAB3' */
-    WRITE_U32(p + 4, 2u);          /* v2: edge endpoints are u32 node indices */
+    WRITE_U32(p + 4, 3u); /* v3: v2 + per-node in_calls/lines/status */
     WRITE_U32(p + 8, (uint32_t)n);
     WRITE_U32(p + 12, (uint32_t)e);
     WRITE_U32(p + 16, (uint32_t)r->total_nodes);
@@ -1118,10 +1137,29 @@ void *cbm_layout_to_binary(const cbm_layout_result_t *r, size_t *out_size) {
         memcpy(p, qn_off, sec_qn_off);
     p += sec_qn_off;
 
+    /* v3: per-node inbound-call counts + source line range (u32 each) */
+    for (int i = 0; i < n; i++) {
+        WRITE_U32(p, (uint32_t)(r->nodes[i].in_calls < 0 ? 0 : r->nodes[i].in_calls));
+        p += 4;
+    }
+    for (int i = 0; i < n; i++) {
+        WRITE_U32(p, (uint32_t)(r->nodes[i].start_line < 0 ? 0 : r->nodes[i].start_line));
+        p += 4;
+    }
+    for (int i = 0; i < n; i++) {
+        WRITE_U32(p, (uint32_t)(r->nodes[i].end_line < 0 ? 0 : r->nodes[i].end_line));
+        p += 4;
+    }
+
     /* Per-node label id (uint8) */
     if (n > 0)
         memcpy(p, node_label_id, sec_node_lbl);
     p += sec_node_lbl;
+
+    /* v3: per-node dead-code status (u8 enum, see status_wire_id) */
+    for (int i = 0; i < n; i++) {
+        *p++ = status_wire_id(r->nodes[i].status);
+    }
 
     /* Per-edge type id (uint8) */
     if (e > 0)

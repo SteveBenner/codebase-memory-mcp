@@ -516,7 +516,7 @@ TEST(layout_to_binary_roundtrip) {
     memcpy(&etype_count, p + 28, 4);
 
     ASSERT_EQ((long long)magic, 0x4C414233);
-    ASSERT_EQ((long long)version, 2);
+    ASSERT_EQ((long long)version, 3);
     ASSERT_EQ((long long)node_count, 3);
     ASSERT_EQ((long long)edge_count, 1);
     ASSERT_EQ((long long)total_nodes, 3);
@@ -540,13 +540,33 @@ TEST(layout_to_binary_roundtrip) {
     /* Total size matches what the parser will walk through. Layout:
      *   header(32) + ids(8N) + edge_src(4E) + edge_tgt(4E) + pos(12N) +
      *   sizes(4N) + colors(4N) + name_off(4N) + path_off(4N) + qn_off(4N) +
-     *   node_lbl(N) + edge_etype(E) + pad + label_idx(4L) + etype_idx(4T) +
-     *   strings_padded.
-     * With N=3, E=1: pad = (4 - (3+1)) & 3 = 0. */
+     *   in_calls(4N) + start_line(4N) + end_line(4N) +
+     *   node_lbl(N) + status(N) + edge_etype(E) + pad + label_idx(4L) +
+     *   etype_idx(4T) + strings_padded.
+     * With N=3, E=1: pad = (4 - (3+3+1)) & 3 = 1. */
     size_t expected_min =
-        32 + 8 * 3 + 4 * 1 + 4 * 1 + 12 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 3 + 1 +
-        0 + 4 * 2 + 4 * 1;
+        32 + 8 * 3 + 4 * 1 + 4 * 1 + 12 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 +
+        4 * 3 + 4 * 3 + 3 + 3 + 1 + 1 + 4 * 2 + 4 * 1;
     ASSERT_GTE((long long)blob_size, (long long)expected_min);
+
+    /* v3 sections: verify start/end lines roundtrip for node 0 and that
+     * every status byte is a valid enum (0..6). Section offsets follow the
+     * layout arithmetic above. */
+    {
+        size_t off_u32_block = 32 + 8 * 3 + 4 * 1 + 4 * 1 + 12 * 3 + 4 * 3 + 4 * 3 + 4 * 3 +
+                               4 * 3 + 4 * 3;
+        uint32_t v_in_calls, v_start, v_end;
+        memcpy(&v_in_calls, p + off_u32_block, 4);
+        memcpy(&v_start, p + off_u32_block + 4 * 3, 4);
+        memcpy(&v_end, p + off_u32_block + 4 * 3 + 4 * 3, 4);
+        ASSERT_EQ((long long)v_start, 1);
+        ASSERT_EQ((long long)v_end, 5);
+        (void)v_in_calls; /* value depends on classification; enum check below */
+        const uint8_t *status_sec = p + off_u32_block + 3 * 4 * 3 + 3 /* node_lbl */;
+        for (int i = 0; i < 3; i++) {
+            ASSERT_LT((long long)status_sec[i], 7);
+        }
+    }
 
     /* The strings byte block lives at the tail of the blob (length
      * `strings_size`). Walk it looking for the sentinel names we inserted
@@ -590,7 +610,7 @@ TEST(layout_to_binary_empty) {
     memcpy(&magic, blob, 4);
     memcpy(&version, (const uint8_t *)blob + 4, 4);
     ASSERT_EQ((long long)magic, 0x4C414233);
-    ASSERT_EQ((long long)version, 2);
+    ASSERT_EQ((long long)version, 3);
 
     free(blob);
     cbm_layout_free(r);

@@ -17,7 +17,18 @@
  * sections (positions, sizes, colors, string offsets, label/etype ids,
  * padding, offset tables, strings) is byte-identical to v1.
  */
-import type { GraphData, GraphNode, GraphEdge } from "./types";
+import type { GraphData, GraphNode, GraphEdge, NodeStatus } from "./types";
+
+/* Wire enum for the dead-code status (v3). Order pinned in layout3d.h. */
+const STATUS_NAMES: NodeStatus[] = [
+  "dead",
+  "single",
+  "entry",
+  "test",
+  "exported",
+  "normal",
+  "structural",
+];
 
 const MAGIC = 0x4c414233; /* 'LAB3' */
 const HEADER_SIZE = 32;
@@ -41,6 +52,12 @@ export interface GraphView {
   readonly edgeTgtIdx: Int32Array; /* length = edgeCount */
   readonly edgeTypeId: Uint8Array; /* length = edgeCount */
 
+  /* v3 per-node metadata (dead-code view + code preview / deep links). */
+  readonly inCalls: Uint32Array; /* inbound CALLS-family degree */
+  readonly startLines: Uint32Array; /* 1-based; 0 = unknown */
+  readonly endLines: Uint32Array; /* 1-based; 0 = unknown */
+  readonly statusId: Uint8Array; /* index into STATUS_NAMES */
+
   /* String dictionary (small enumerations, dereferenced into ids by index). */
   readonly labels: string[];
   readonly edgeTypes: string[];
@@ -54,6 +71,7 @@ export interface GraphView {
   getQn(i: number): string;
   getLabel(i: number): string;
   getEdgeType(i: number): string;
+  getStatus(i: number): NodeStatus;
   /* Build a one-off GraphNode object for code paths (tooltip, side panel)
    * that still want the legacy object shape. Allocation is intentional. */
   nodeAt(i: number): GraphNode;
@@ -84,7 +102,7 @@ export function parseLayoutBinary(buf: ArrayBuffer): GraphView {
     throw new Error(`bad magic: 0x${magic.toString(16)} (expected 0x4c414233)`);
   }
   const version = dv.getUint32(4, true);
-  if (version !== 2) {
+  if (version !== 3) {
     throw new Error(`unsupported layout.bin version ${version}`);
   }
   const nodeCount = dv.getUint32(8, true);
@@ -151,10 +169,21 @@ export function parseLayoutBinary(buf: ArrayBuffer): GraphView {
   const qnOff = new Uint32Array(buf, p, nodeCount);
   p += nodeCount * 4;
 
+  /* v3: inbound-call counts + source line ranges (zero-copy u32 views). */
+  const inCalls = new Uint32Array(buf, p, nodeCount);
+  p += nodeCount * 4;
+  const startLines = new Uint32Array(buf, p, nodeCount);
+  p += nodeCount * 4;
+  const endLines = new Uint32Array(buf, p, nodeCount);
+  p += nodeCount * 4;
+
   /* u8 sections (byte views — alignment is a non-issue for u8). The C side
    * pads after these to restore 4-byte alignment for the u32 offset tables
    * that follow. */
   const nodeLabelId = new Uint8Array(buf, p, nodeCount);
+  p += nodeCount;
+  /* v3: dead-code status enum (u8 per node). */
+  const statusId = new Uint8Array(buf, p, nodeCount);
   p += nodeCount;
   const edgeTypeId = new Uint8Array(buf, p, edgeCount);
   p += edgeCount;
@@ -197,6 +226,10 @@ export function parseLayoutBinary(buf: ArrayBuffer): GraphView {
     edgeSrcIdx,
     edgeTgtIdx,
     edgeTypeId,
+    inCalls,
+    startLines,
+    endLines,
+    statusId,
     labels,
     edgeTypes,
     getName: (i) => readCString(decoder, stringBytes, nameOff[i]),
@@ -204,6 +237,7 @@ export function parseLayoutBinary(buf: ArrayBuffer): GraphView {
     getQn: (i) => readCString(decoder, stringBytes, qnOff[i]),
     getLabel: (i) => labels[nodeLabelId[i]] ?? "",
     getEdgeType: (i) => edgeTypes[edgeTypeId[i]] ?? "",
+    getStatus: (i) => STATUS_NAMES[statusId[i]] ?? "normal",
     nodeAt: (i) => ({
       id: nodeIds[i],
       x: positions[i * 3],
@@ -214,6 +248,10 @@ export function parseLayoutBinary(buf: ArrayBuffer): GraphView {
       file_path: readCString(decoder, stringBytes, pathOff[i]) || undefined,
       size: sizes[i],
       color: "#" + colors[i].toString(16).padStart(6, "0"),
+      status: STATUS_NAMES[statusId[i]] ?? "normal",
+      in_calls: inCalls[i],
+      start_line: startLines[i] || undefined,
+      end_line: endLines[i] || undefined,
     }),
     indexOfId: (id: number) => {
       if (!idToIdx) {

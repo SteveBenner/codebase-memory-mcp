@@ -78,13 +78,13 @@ void cbm_layout_free(cbm_layout_result_t *result);
 /* Serialize layout result to JSON string. Caller must free(). */
 char *cbm_layout_to_json(const cbm_layout_result_t *result);
 
-/* ── Binary wire format (v2) ──────────────────────────────────────
+/* ── Binary wire format (v3) ──────────────────────────────────────
  *
  * Layout: little-endian, contiguous sections in the physical order below.
  *
  *   header (32 bytes):
  *     u32 magic        = 0x4C414233 ('LAB3')
- *     u32 version      = 2
+ *     u32 version      = 3
  *     u32 node_count
  *     u32 edge_count
  *     u32 total_nodes  (total in project before any cap)
@@ -103,7 +103,12 @@ char *cbm_layout_to_json(const cbm_layout_result_t *result);
  *     u32[node_count]   name_off  (byte offset into strings table)
  *     u32[node_count]   path_off  (byte offset; 0 = no path)
  *     u32[node_count]   qn_off    (byte offset; 0 = no qn)
+ *     u32[node_count]   in_calls  (inbound CALLS-family degree, v3)
+ *     u32[node_count]   start_line (1-based; 0 = unknown, v3)
+ *     u32[node_count]   end_line   (1-based; 0 = unknown, v3)
  *     u8 [node_count]   label_id  (index into label index)
+ *     u8 [node_count]   status_id (dead-code enum, v3: 0=dead 1=single
+ *                       2=entry 3=test 4=exported 5=normal 6=structural)
  *     u8 [edge_count]   etype_id  (index into edge-type index)
  *     u8 [0-3]          zero pad to the next 4-byte boundary
  *     u32[label_count]  label string offsets
@@ -119,6 +124,10 @@ char *cbm_layout_to_json(const cbm_layout_result_t *result);
  * v1 → v2: the two edge sections were i64 node IDs in v1; v2 sends u32
  * node INDICES instead (halves the edge payload and saves the frontend an
  * id→index hash lookup per edge endpoint).
+ *
+ * v2 → v3: adds the per-node in_calls/start_line/end_line u32 sections and
+ * the status_id u8 section so the dead-code view works on the binary fast
+ * path without materializing JSON nodes.
  *
  * Offset 0 in any name_off/path_off/qn_off field means "absent" — readers
  * must check for it before dereferencing.
