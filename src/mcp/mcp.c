@@ -4354,8 +4354,10 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         }
     }
 
-/* Default file limit for auto-indexing new projects */
-#define DEFAULT_AUTO_INDEX_LIMIT 50000
+/* Auto-indexing file cap. 0 = no cap (default). Users who want a guard
+ * against accidentally indexing a 10M-file monorepo can opt in via
+ * `config set auto_index_limit <N>`. */
+#define DEFAULT_AUTO_INDEX_LIMIT 0
 
     /* Check auto_index config */
     bool auto_index = false;
@@ -4372,26 +4374,29 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Quick file count check to avoid OOM on massive repos */
-    if (!cbm_validate_shell_arg(srv->session_root)) {
-        cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
-        return;
-    }
-    char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
-    FILE *fp = cbm_popen(cmd, "r");
-    if (fp) {
-        char line[CBM_SZ_64];
-        if (fgets(line, sizeof(line), fp)) {
-            int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
-            if (count > file_limit) {
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line, "limit",
-                             CBM_CONFIG_AUTO_INDEX_LIMIT);
-                cbm_pclose(fp);
-                return;
-            }
+    /* Optional file count guard — only runs when the user has explicitly
+     * configured a positive limit. Without it we index everything. */
+    if (file_limit > 0) {
+        if (!cbm_validate_shell_arg(srv->session_root)) {
+            cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
+            return;
         }
-        cbm_pclose(fp);
+        char cmd[CBM_SZ_1K];
+        snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
+        FILE *fp = cbm_popen(cmd, "r");
+        if (fp) {
+            char line[CBM_SZ_64];
+            if (fgets(line, sizeof(line), fp)) {
+                int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
+                if (count > file_limit) {
+                    cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line,
+                                 "limit", CBM_CONFIG_AUTO_INDEX_LIMIT);
+                    cbm_pclose(fp);
+                    return;
+                }
+            }
+            cbm_pclose(fp);
+        }
     }
 
     /* Launch auto-index in background */

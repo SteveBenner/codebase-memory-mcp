@@ -4,11 +4,12 @@ import { OrbitControls } from "@react-three/drei";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
 import { EffectComposer, Bloom } from "@react-three/postprocessing";
 import * as THREE from "three";
-import { NodeCloud } from "./NodeCloud";
-import { EdgeLines } from "./EdgeLines";
+import { NodeCloud, NodeCloudFromData } from "./NodeCloud";
+import { EdgeLines, EdgeLinesFromData } from "./EdgeLines";
 import { NodeLabels } from "./NodeLabels";
 import { NodeTooltip } from "./NodeTooltip";
 import type { GraphData, GraphNode, LinkedProject } from "../lib/types";
+import { getView, type GraphView } from "../lib/layoutBinary";
 
 /* ── Camera fly-to animation ────────────────────────────── */
 
@@ -84,6 +85,13 @@ function IdleAutoRotate({
 
 /* ── Main scene ─────────────────────────────────────────── */
 
+/* Bloom (EffectComposer) is a fixed full-resolution GPU cost every frame,
+ * regardless of scene content. Past this node count we drop it: node colors
+ * are already boosted >1.0 (see NodeCloud's packColors*), so the scene stays
+ * readable without the glow — the gate trades bloom for frame rate at
+ * extreme scale. */
+const BLOOM_MAX_NODES = 300_000;
+
 interface GraphSceneProps {
   data: GraphData;
   highlightedIds: Set<number> | null;
@@ -104,6 +112,12 @@ export function GraphScene({
   const [hovered, setHovered] = useState<GraphNode | null>(null);
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
 
+  /* Primary node count for the bloom gate. getView is checked FIRST:
+   * touching data.nodes on the binary path would trigger the lazy getter
+   * that materializes ~1M GraphNode objects just to read .length (see
+   * viewToGraphData in layoutBinary.ts). */
+  const primaryNodeCount = getView(data)?.nodeCount ?? data.nodes.length;
+
   return (
     <Canvas
       camera={{ position: [0, 0, 800], fov: 50, near: 0.1, far: 100000 }}
@@ -120,13 +134,11 @@ export function GraphScene({
         color="#6040ff"
       />
 
-      <EdgeLines
-        nodes={data.nodes}
-        edges={data.edges}
-        highlightedIds={highlightedIds}
-      />
-      <NodeCloud
-        nodes={data.nodes}
+      {/* Primary cluster: routes through the view-aware path when binary
+       * loader is active (1M+ nodes), falls back to legacy props otherwise. */}
+      <EdgeLinesFromData data={data} highlightedIds={highlightedIds} />
+      <NodeCloudFromData
+        data={data}
         highlightedIds={highlightedIds}
         onHover={setHovered}
         onClick={onNodeClick}
@@ -176,15 +188,17 @@ export function GraphScene({
       <CameraAnimator target={cameraTarget} />
       <IdleAutoRotate controlsRef={controlsRef} />
 
-      <EffectComposer>
-        <Bloom
-          luminanceThreshold={0.3}
-          luminanceSmoothing={0.7}
-          intensity={1.2}
-          mipmapBlur
-          radius={0.6}
-        />
-      </EffectComposer>
+      {primaryNodeCount <= BLOOM_MAX_NODES && (
+        <EffectComposer>
+          <Bloom
+            luminanceThreshold={0.3}
+            luminanceSmoothing={0.7}
+            intensity={1.2}
+            mipmapBlur
+            radius={0.6}
+          />
+        </EffectComposer>
+      )}
 
       <OrbitControls
         ref={controlsRef}
@@ -248,5 +262,57 @@ export function computeCameraTarget(
     cz + distance,
   );
 
+  return { position, lookAt };
+}
+
+/* Typed-array variant — same math as computeCameraTarget but reads positions
+ * from the view's Float32Array without materializing GraphNode objects. Used
+ * on the binary load path where the JS edge/node arrays would otherwise be
+ * forced into existence by a single click. */
+export function computeCameraTargetFromView(
+  view: GraphView,
+  ids: Set<number>,
+): CameraTarget | null {
+  if (ids.size === 0) return null;
+  const pos = view.positions;
+  const nodeIds = view.nodeIds;
+
+  let cx = 0,
+    cy = 0,
+    cz = 0,
+    count = 0;
+  for (let i = 0; i < view.nodeCount; i++) {
+    if (ids.has(nodeIds[i])) {
+      cx += pos[i * 3];
+      cy += pos[i * 3 + 1];
+      cz += pos[i * 3 + 2];
+      count++;
+    }
+  }
+  if (count === 0) return null;
+  cx /= count;
+  cy /= count;
+  cz /= count;
+
+  let maxDist = 0;
+  for (let i = 0; i < view.nodeCount; i++) {
+    if (ids.has(nodeIds[i])) {
+      const dx = pos[i * 3] - cx;
+      const dy = pos[i * 3 + 1] - cy;
+      const dz = pos[i * 3 + 2] - cz;
+      const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (d > maxDist) maxDist = d;
+    }
+  }
+
+  const spreadDist = maxDist * 3;
+  const minDist = count <= 5 ? 300 : 200;
+  const distance = Math.max(minDist, spreadDist);
+  const lookAt = new THREE.Vector3(cx, cy, cz);
+  const position = new THREE.Vector3(
+    cx + distance * 0.2,
+    cy + distance * 0.15,
+    cz + distance,
+  );
   return { position, lookAt };
 }

@@ -2581,8 +2581,8 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("Config keys:\n");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
                "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
-               "Max files for auto-indexing new projects");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "0",
+               "Optional cap on files when auto-indexing (0 = no cap)");
         return 0;
     }
 
@@ -2607,7 +2607,7 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "0"));
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");

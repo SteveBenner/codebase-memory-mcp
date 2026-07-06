@@ -34,6 +34,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
@@ -969,11 +970,24 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    int max_nodes = 50000;
+    /* 0 = no cap (default). Callers that want a hard cap must opt in. */
+    int max_nodes = 0;
     if (cbm_http_query_param(req->query, "max_nodes", max_str, (int)sizeof(max_str))) {
         int v = atoi(max_str);
         if (v > 0)
             max_nodes = v;
+    }
+
+    /* ?lod=overview → truncated quick preview (~2000 nodes) that renders
+     * effectively instantly while the full payload streams in behind it.
+     * Default is detail (everything). An explicit max_nodes wins. */
+    char lod_str[16] = {0};
+    cbm_layout_level_t level = CBM_LAYOUT_DETAIL;
+    if (cbm_http_query_param(req->query, "lod", lod_str, (int)sizeof(lod_str)) &&
+        strcmp(lod_str, "overview") == 0) {
+        level = CBM_LAYOUT_OVERVIEW;
+        if (max_nodes == 0)
+            max_nodes = 2000;
     }
 
     char db_path[1024];
@@ -990,8 +1004,7 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    cbm_layout_result_t *layout =
-        cbm_layout_compute(store, project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
+    cbm_layout_result_t *layout = cbm_layout_compute(store, project, level, NULL, 0, max_nodes);
 
     /* Find linked projects from CROSS_* edges. Keep `store` open through the
      * linked-projects loop below so we can resolve target Route QNs against
@@ -1190,6 +1203,218 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 }
 
+/* ── /api/layout.bin blob cache ───────────────────────────────────
+ *
+ * The layout pipeline (SQLite fetch + 40 Barnes-Hut iterations) is fully
+ * deterministic for a given database state, so the serialized blob can be
+ * reused until the DB changes. Validity = mtime+size of the DB file AND of
+ * its WAL sibling ("<db>-wal" — SQLite in WAL mode appends to the -wal file
+ * and leaves the main db untouched until checkpoint; a missing -wal stats
+ * as absent, which is itself a valid state to compare).
+ *
+ * No locking: the server handles requests sequentially on one thread (see
+ * the design-constraints comment in httpd.h). Only /api/layout.bin is
+ * cached; the JSON /api/layout endpoint stays uncached. */
+
+#define LAYOUT_CACHE_SLOTS 4
+/* Sanity gate: blobs above this are served but never cached. */
+#define LAYOUT_CACHE_MAX_BLOB ((size_t)512 * 1024 * 1024)
+
+typedef struct {
+    bool present; /* stat() succeeded at fill time */
+    int64_t mtime;
+    int64_t size;
+} layout_cache_stat_t;
+
+typedef struct {
+    char key[512]; /* "<project>|<level>|<max_nodes>"; "" = empty slot */
+    void *blob;    /* owned copy of the serialized layout */
+    size_t blob_size;
+    char etag[24];              /* strong ETag: "<16 hex chars>" incl. quotes */
+    layout_cache_stat_t db_st;  /* main db file at fill time */
+    layout_cache_stat_t wal_st; /* "<db>-wal" sibling at fill time */
+    uint64_t last_use;          /* monotonic use counter for LRU eviction */
+} layout_cache_entry_t;
+
+static layout_cache_entry_t g_layout_cache[LAYOUT_CACHE_SLOTS];
+static uint64_t g_layout_cache_clock = 0;
+
+/* Snapshot mtime+size of one file; an absent file is a valid state. */
+static void layout_cache_stat(const char *path, layout_cache_stat_t *out) {
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        out->present = true;
+        out->mtime = (int64_t)st.st_mtime;
+        out->size = (int64_t)st.st_size;
+    } else {
+        out->present = false;
+        out->mtime = 0;
+        out->size = 0;
+    }
+}
+
+static bool layout_cache_stat_eq(const layout_cache_stat_t *a, const layout_cache_stat_t *b) {
+    return a->present == b->present && a->mtime == b->mtime && a->size == b->size;
+}
+
+/* FNV-1a 64-bit over the blob bytes → strong ETag, quotes included. */
+static void layout_cache_etag(const void *data, size_t len, char *out, size_t outsz) {
+    const uint8_t *p = data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    snprintf(out, outsz, "\"%016llx\"", (unsigned long long)h);
+}
+
+/* Send a cached-or-fresh blob, honoring If-None-Match (304, empty body). */
+static void layout_binary_send(cbm_http_conn_t *c, const cbm_http_req_t *req, const void *blob,
+                               size_t blob_size, const char *etag) {
+    char hdrs[512];
+    if (req->if_none_match[0] != '\0' && strcmp(req->if_none_match, etag) == 0) {
+        snprintf(hdrs, sizeof(hdrs), "%sETag: %s\r\n", g_cors, etag);
+        cbm_http_reply_buf(c, 304, hdrs, NULL, 0);
+        return;
+    }
+    snprintf(hdrs, sizeof(hdrs), "%sContent-Type: application/octet-stream\r\nETag: %s\r\n",
+             g_cors, etag);
+    cbm_http_reply_buf(c, 200, hdrs, blob, blob_size);
+}
+
+/* ── GET /api/layout.bin ──────────────────────────────────────────
+ *
+ * Returns the primary project's layout as a compact binary blob (see
+ * cbm_layout_to_binary in layout3d.h). Cuts payload ~5-10x vs. JSON and the
+ * frontend can hand position/color buffers straight to the GPU without
+ * per-node JS object construction.
+ *
+ * Linked-project galaxies are NOT included here; they remain on the JSON
+ * endpoint. The high-scale path (1M+ nodes) is single-project and rarely
+ * needs cross-repo overlay simultaneously. */
+static void handle_layout_binary(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    char max_str[32] = {0};
+    char lod_str[16] = {0};
+
+    if (!cbm_http_query_param(req->query, "project", project, (int)sizeof(project)) ||
+        project[0] == '\0') {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
+        return;
+    }
+
+    int max_nodes = 0;
+    if (cbm_http_query_param(req->query, "max_nodes", max_str, (int)sizeof(max_str))) {
+        int v = atoi(max_str);
+        if (v > 0)
+            max_nodes = v;
+    }
+    cbm_layout_level_t level = CBM_LAYOUT_DETAIL;
+    if (cbm_http_query_param(req->query, "lod", lod_str, (int)sizeof(lod_str)) &&
+        strcmp(lod_str, "overview") == 0) {
+        level = CBM_LAYOUT_OVERVIEW;
+        if (max_nodes == 0)
+            max_nodes = 2000;
+    }
+
+    char db_path[1024];
+    db_path_for_project(project, db_path, sizeof(db_path));
+
+    if (!cbm_file_exists(db_path)) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
+
+    /* Cache lookup — exact key match, then freshness via db + wal stat. */
+    char key[512];
+    snprintf(key, sizeof(key), "%s|%d|%d", project, (int)level, max_nodes);
+    char wal_path[1040];
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    layout_cache_stat_t db_st, wal_st;
+    layout_cache_stat(db_path, &db_st);
+    layout_cache_stat(wal_path, &wal_st);
+
+    for (int i = 0; i < LAYOUT_CACHE_SLOTS; i++) {
+        layout_cache_entry_t *ent = &g_layout_cache[i];
+        if (ent->key[0] == '\0' || strcmp(ent->key, key) != 0)
+            continue;
+        if (layout_cache_stat_eq(&ent->db_st, &db_st) &&
+            layout_cache_stat_eq(&ent->wal_st, &wal_st)) {
+            ent->last_use = ++g_layout_cache_clock;
+            layout_binary_send(c, req, ent->blob, ent->blob_size, ent->etag);
+            return;
+        }
+        /* Stale — drop the entry and recompute below. */
+        free(ent->blob);
+        memset(ent, 0, sizeof(*ent));
+        break;
+    }
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
+        return;
+    }
+
+    cbm_layout_result_t *layout = cbm_layout_compute(store, project, level, NULL, 0, max_nodes);
+    cbm_store_close(store);
+
+    if (!layout) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"layout computation failed\"}");
+        return;
+    }
+
+    size_t blob_size = 0;
+    void *blob = cbm_layout_to_binary(layout, &blob_size);
+    cbm_layout_free(layout);
+
+    if (!blob || blob_size == 0) {
+        free(blob);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"binary serialization failed\"}");
+        return;
+    }
+
+    char etag[24];
+    layout_cache_etag(blob, blob_size, etag, sizeof(etag));
+
+    /* Store a copy (the cache owns its blob). Oversized blobs are served
+     * but never cached. The stats were taken BEFORE the compute, so a DB
+     * that changed mid-compute stats differently on the next lookup and
+     * the entry is treated as stale — conservative and correct. */
+    if (blob_size <= LAYOUT_CACHE_MAX_BLOB) {
+        layout_cache_entry_t *slot = NULL;
+        for (int i = 0; i < LAYOUT_CACHE_SLOTS; i++) {
+            if (g_layout_cache[i].key[0] == '\0') {
+                slot = &g_layout_cache[i];
+                break;
+            }
+        }
+        if (!slot) {
+            slot = &g_layout_cache[0];
+            for (int i = 1; i < LAYOUT_CACHE_SLOTS; i++) {
+                if (g_layout_cache[i].last_use < slot->last_use)
+                    slot = &g_layout_cache[i];
+            }
+            free(slot->blob); /* evict LRU entry's blob */
+            memset(slot, 0, sizeof(*slot));
+        }
+        void *copy = malloc(blob_size);
+        if (copy) {
+            memcpy(copy, blob, blob_size);
+            snprintf(slot->key, sizeof(slot->key), "%s", key);
+            slot->blob = copy;
+            slot->blob_size = blob_size;
+            snprintf(slot->etag, sizeof(slot->etag), "%s", etag);
+            slot->db_st = db_st;
+            slot->wal_st = wal_st;
+            slot->last_use = ++g_layout_cache_clock;
+        }
+    }
+
+    layout_binary_send(c, req, blob, blob_size, etag);
+    free(blob);
+}
+
 /* ── Handle JSON-RPC request ──────────────────────────────────── */
 
 static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_server_t *mcp) {
@@ -1234,7 +1459,13 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* GET /api/layout → 3D graph layout */
+    /* GET /api/layout.bin → compact binary layout (primary project only) */
+    if (is_get && cbm_http_path_match(req->path, "/api/layout.bin*")) {
+        handle_layout_binary(c, req);
+        return;
+    }
+
+    /* GET /api/layout → 3D graph layout (JSON, incl. linked galaxies) */
     if (is_get && cbm_http_path_match(req->path, "/api/layout*")) {
         handle_layout(c, req);
         return;

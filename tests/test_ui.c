@@ -1,22 +1,38 @@
 /*
  * test_ui.c — Tests for the graph visualization UI module.
  *
- * Covers: config persistence, embedded asset lookup, layout engine.
+ * Covers: config persistence, embedded asset lookup, layout engine, and the
+ * /api/layout.bin blob cache + ETag path (live-socket, ephemeral port).
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/compat_thread.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
+#include "ui/http_server.h"
 #include "ui/layout3d.h"
 #include "store/store.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET tu_sock_t;
+#define tu_sock_close closesocket
+#define TU_SOCK_BAD INVALID_SOCKET
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <unistd.h>
+typedef int tu_sock_t;
+#define tu_sock_close close
+#define TU_SOCK_BAD (-1)
 #endif
 
 /* ── Config tests ─────────────────────────────────────────────── */
@@ -393,6 +409,245 @@ TEST(layout_to_json) {
     PASS();
 }
 
+TEST(layout_to_binary_roundtrip) {
+    /* Verify the binary layout format produced by cbm_layout_to_binary
+     * matches the format the frontend parser expects: header magic, counts,
+     * per-section sizes, 4-byte alignment before the strings table, and
+     * round-trippable string offsets. */
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    /* Three nodes, one edge — small enough to inspect by hand, large enough
+     * to exercise multi-element arrays + edge offsets. */
+    cbm_node_t a = {.project = "test",
+                    .label = "Function",
+                    .name = "alpha",
+                    .qualified_name = "test::alpha",
+                    .file_path = "a.c",
+                    .start_line = 1,
+                    .end_line = 5};
+    cbm_node_t b = {.project = "test",
+                    .label = "Function",
+                    .name = "beta",
+                    .qualified_name = "test::beta",
+                    .file_path = "b.c",
+                    .start_line = 1,
+                    .end_line = 5};
+    cbm_node_t c = {.project = "test",
+                    .label = "Class",
+                    .name = "Gamma",
+                    .qualified_name = "test::Gamma",
+                    .file_path = "c.c",
+                    .start_line = 1,
+                    .end_line = 5};
+    int64_t ida = cbm_store_upsert_node(store, &a);
+    int64_t idb = cbm_store_upsert_node(store, &b);
+    int64_t idc = cbm_store_upsert_node(store, &c);
+    ASSERT_GT(ida, 0);
+    ASSERT_GT(idb, 0);
+    ASSERT_GT(idc, 0);
+
+    cbm_edge_t e1 = {.project = "test", .source_id = ida, .target_id = idb, .type = "CALLS"};
+    cbm_store_insert_edge(store, &e1);
+
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_DETAIL, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, 3);
+    ASSERT_EQ(r->edge_count, 1);
+
+    size_t blob_size = 0;
+    void *blob = cbm_layout_to_binary(r, &blob_size);
+    ASSERT_NOT_NULL(blob);
+    ASSERT_GT((long long)blob_size, 32);
+
+    const uint8_t *p = (const uint8_t *)blob;
+    uint32_t magic, version, node_count, edge_count, total_nodes, strings_size, label_count,
+        etype_count;
+    memcpy(&magic, p + 0, 4);
+    memcpy(&version, p + 4, 4);
+    memcpy(&node_count, p + 8, 4);
+    memcpy(&edge_count, p + 12, 4);
+    memcpy(&total_nodes, p + 16, 4);
+    memcpy(&strings_size, p + 20, 4);
+    memcpy(&label_count, p + 24, 4);
+    memcpy(&etype_count, p + 28, 4);
+
+    ASSERT_EQ((long long)magic, 0x4C414233);
+    ASSERT_EQ((long long)version, 2);
+    ASSERT_EQ((long long)node_count, 3);
+    ASSERT_EQ((long long)edge_count, 1);
+    ASSERT_EQ((long long)total_nodes, 3);
+    /* Two distinct labels (Function, Class), one edge type (CALLS). */
+    ASSERT_EQ((long long)label_count, 2);
+    ASSERT_EQ((long long)etype_count, 1);
+
+    /* v2 edge sections: u32 src_idx / u32 tgt_idx directly after the node-id
+     * array. Resolve the indices through the node ids and check they point
+     * at the edge we inserted (ida → idb). */
+    int64_t node_ids[3];
+    memcpy(node_ids, p + 32, sizeof(node_ids));
+    uint32_t src_idx, tgt_idx;
+    memcpy(&src_idx, p + 32 + 8 * 3, 4);
+    memcpy(&tgt_idx, p + 32 + 8 * 3 + 4 * 1, 4);
+    ASSERT_LT((long long)src_idx, 3);
+    ASSERT_LT((long long)tgt_idx, 3);
+    ASSERT_EQ(node_ids[src_idx], ida);
+    ASSERT_EQ(node_ids[tgt_idx], idb);
+
+    /* Total size matches what the parser will walk through. Layout:
+     *   header(32) + ids(8N) + edge_src(4E) + edge_tgt(4E) + pos(12N) +
+     *   sizes(4N) + colors(4N) + name_off(4N) + path_off(4N) + qn_off(4N) +
+     *   node_lbl(N) + edge_etype(E) + pad + label_idx(4L) + etype_idx(4T) +
+     *   strings_padded.
+     * With N=3, E=1: pad = (4 - (3+1)) & 3 = 0. */
+    size_t expected_min =
+        32 + 8 * 3 + 4 * 1 + 4 * 1 + 12 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 4 * 3 + 3 + 1 +
+        0 + 4 * 2 + 4 * 1;
+    ASSERT_GTE((long long)blob_size, (long long)expected_min);
+
+    /* The strings byte block lives at the tail of the blob (length
+     * `strings_size`). Walk it looking for the sentinel names we inserted
+     * to confirm interning happened. We use a manual scan rather than
+     * memmem() because the latter is not portable across all platforms. */
+    const uint8_t *strings = p + (blob_size - strings_size);
+    const char *needles[] = {"alpha", "beta",  "Gamma",
+                             "Function", "Class", "CALLS"};
+    for (int i = 0; i < 6; i++) {
+        size_t nl = strlen(needles[i]);
+        int found = 0;
+        for (size_t off = 0; off + nl <= strings_size; off++) {
+            if (memcmp(strings + off, needles[i], nl) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        ASSERT(found);
+    }
+
+    free(blob);
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(layout_to_binary_empty) {
+    /* Empty store still produces a valid header-only blob. */
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_DETAIL, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, 0);
+
+    size_t blob_size = 0;
+    void *blob = cbm_layout_to_binary(r, &blob_size);
+    ASSERT_NOT_NULL(blob);
+    ASSERT_GTE((long long)blob_size, 32);
+
+    uint32_t magic, version;
+    memcpy(&magic, blob, 4);
+    memcpy(&version, (const uint8_t *)blob + 4, 4);
+    ASSERT_EQ((long long)magic, 0x4C414233);
+    ASSERT_EQ((long long)version, 2);
+
+    free(blob);
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(layout_overview_filters_low_degree) {
+    /* One hub (degree 3) + three leaves (degree 1): OVERVIEW must return
+     * only the degree >= 2 hub, while DETAIL returns everything. */
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    cbm_node_t hub = {.project = "test",
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "test::hub",
+                      .file_path = "hub.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    int64_t hub_id = cbm_store_upsert_node(store, &hub);
+    ASSERT_GT(hub_id, 0);
+    for (int i = 0; i < 3; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "leaf%d", i);
+        snprintf(qn, sizeof(qn), "test::leaf%d", i);
+        cbm_node_t leaf = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "leaf.c",
+                           .start_line = i,
+                           .end_line = i + 1};
+        int64_t leaf_id = cbm_store_upsert_node(store, &leaf);
+        cbm_edge_t edge = {
+            .project = "test", .source_id = hub_id, .target_id = leaf_id, .type = "CALLS"};
+        cbm_store_insert_edge(store, &edge);
+    }
+
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, 1);
+    ASSERT_STR_EQ(r->nodes[0].name, "hub");
+    /* Leaves are filtered out, so hub→leaf edges have no surviving target. */
+    ASSERT_EQ(r->edge_count, 0);
+    /* total_nodes reports the whole project, not just the hubs. */
+    ASSERT_EQ(r->total_nodes, 4);
+    cbm_layout_free(r);
+
+    cbm_layout_result_t *d = cbm_layout_compute(store, "test", CBM_LAYOUT_DETAIL, NULL, 0, 100);
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ(d->node_count, 4);
+    ASSERT_EQ(d->edge_count, 3);
+    cbm_layout_free(d);
+
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(layout_overview_fallback_when_no_hubs) {
+    /* Every node has degree < 2, so the min_degree filter matches nothing.
+     * OVERVIEW must fall back to an unfiltered fetch — never an empty
+     * preview on a non-empty project. */
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "foo",
+                     .qualified_name = "test::foo",
+                     .file_path = "a.c",
+                     .start_line = 1,
+                     .end_line = 5};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "bar",
+                     .qualified_name = "test::bar",
+                     .file_path = "b.c",
+                     .start_line = 1,
+                     .end_line = 5};
+    int64_t id1 = cbm_store_upsert_node(store, &n1);
+    int64_t id2 = cbm_store_upsert_node(store, &n2);
+    cbm_edge_t edge = {.project = "test", .source_id = id1, .target_id = id2, .type = "CALLS"};
+    cbm_store_insert_edge(store, &edge);
+
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, 2);
+    ASSERT_EQ(r->edge_count, 1);
+    ASSERT_EQ(r->total_nodes, 2);
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(layout_null_inputs) {
     /* NULL store → NULL result */
     cbm_layout_result_t *r = cbm_layout_compute(NULL, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
@@ -411,6 +666,183 @@ TEST(layout_null_inputs) {
     ASSERT_NULL(json);
 
     cbm_store_close(store);
+    PASS();
+}
+
+/* ── /api/layout.bin cache + ETag (live socket) ───────────────────
+ *
+ * Minimal raw-socket client mirroring the harness in test_httpd.c —
+ * one-shot exchanges against a real cbm_http_server_t on an ephemeral
+ * port, reading until the server closes (Connection: close model). */
+
+static tu_sock_t tu_connect(int port) {
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa); /* refcounted; cleanup not needed in tests */
+#endif
+    tu_sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == TU_SOCK_BAD)
+        return TU_SOCK_BAD;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((unsigned short)port);
+    addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 */
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        tu_sock_close(s);
+        return TU_SOCK_BAD;
+    }
+    return s;
+}
+
+/* One-shot HTTP exchange. Returns response length, 0 on failure. */
+static int tu_http(int port, const char *request, char *resp, size_t respsz) {
+    tu_sock_t s = tu_connect(port);
+    if (s == TU_SOCK_BAD)
+        return 0;
+    size_t req_len = strlen(request), off = 0;
+    while (off < req_len) {
+#ifdef _WIN32
+        int n = send(s, request + off, (int)(req_len - off), 0);
+#else
+        ssize_t n = send(s, request + off, req_len - off, 0);
+#endif
+        if (n <= 0) {
+            tu_sock_close(s);
+            return 0;
+        }
+        off += (size_t)n;
+    }
+    off = 0;
+    for (;;) {
+#ifdef _WIN32
+        int n = recv(s, resp + off, (int)(respsz - 1 - off), 0);
+#else
+        ssize_t n = recv(s, resp + off, respsz - 1 - off, 0);
+#endif
+        if (n <= 0)
+            break;
+        off += (size_t)n;
+        if (off >= respsz - 1)
+            break;
+    }
+    resp[off] = '\0';
+    tu_sock_close(s);
+    return (int)off;
+}
+
+/* HTTP status code from a raw response ("HTTP/1.1 200 ..."), or -1. */
+static int tu_status(const char *resp) {
+    if (strncmp(resp, "HTTP/1.1 ", 9) != 0)
+        return -1;
+    return atoi(resp + 9);
+}
+
+/* Copy a header value ("\r\nName: " prefix) out of a raw response head. */
+static bool tu_header(const char *resp, const char *prefix, char *out, size_t outsz) {
+    const char *h = strstr(resp, prefix);
+    if (!h)
+        return false;
+    h += strlen(prefix);
+    const char *end = strstr(h, "\r\n");
+    if (!end || (size_t)(end - h) >= outsz)
+        return false;
+    memcpy(out, h, (size_t)(end - h));
+    out[end - h] = '\0';
+    return true;
+}
+
+static void *tu_server_thread(void *arg) {
+    cbm_http_server_run((cbm_http_server_t *)arg);
+    return NULL;
+}
+
+TEST(layout_bin_etag_and_cache) {
+    /* Two identical requests must produce the same strong ETag (the second
+     * one served from the handler-level blob cache), and a request that
+     * presents the ETag via If-None-Match must get a 304 with no body. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_test_etag_XXXXXX");
+    char *td = cbm_mkdtemp(tmpdir);
+    ASSERT_NOT_NULL(td);
+
+    /* Point the server's cache dir at the temp dir and create the project
+     * DB where db_path_for_project() will look for it. */
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", td, 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/etagtest.db", td);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "etagtest", "/tmp/etagtest");
+    cbm_node_t n1 = {.project = "etagtest",
+                     .label = "Function",
+                     .name = "foo",
+                     .qualified_name = "etagtest::foo",
+                     .file_path = "a.c",
+                     .start_line = 1,
+                     .end_line = 5};
+    cbm_node_t n2 = {.project = "etagtest",
+                     .label = "Function",
+                     .name = "bar",
+                     .qualified_name = "etagtest::bar",
+                     .file_path = "b.c",
+                     .start_line = 1,
+                     .end_line = 5};
+    int64_t id1 = cbm_store_upsert_node(store, &n1);
+    int64_t id2 = cbm_store_upsert_node(store, &n2);
+    cbm_edge_t edge = {.project = "etagtest", .source_id = id1, .target_id = id2, .type = "CALLS"};
+    cbm_store_insert_edge(store, &edge);
+    cbm_store_close(store);
+
+    cbm_http_server_t *srv = cbm_http_server_new(0);
+    ASSERT_NOT_NULL(srv);
+    cbm_thread_t tid;
+    ASSERT_EQ(cbm_thread_create(&tid, 0, tu_server_thread, srv), 0);
+    int port = cbm_http_server_port(srv);
+
+    const char *get_req = "GET /api/layout.bin?project=etagtest HTTP/1.1\r\n\r\n";
+    char resp1[16384], resp2[16384], resp3[4096];
+    ASSERT_GT(tu_http(port, get_req, resp1, sizeof(resp1)), 0);
+    ASSERT_EQ(tu_status(resp1), 200);
+    char etag1[64], etag2[64];
+    ASSERT_TRUE(tu_header(resp1, "\r\nETag: ", etag1, sizeof(etag1)));
+    /* strong ETag shape: "<16 hex chars>" including the quotes */
+    ASSERT_EQ((long long)strlen(etag1), 18);
+    ASSERT_EQ(etag1[0], '"');
+    ASSERT_EQ(etag1[17], '"');
+
+    ASSERT_GT(tu_http(port, get_req, resp2, sizeof(resp2)), 0);
+    ASSERT_EQ(tu_status(resp2), 200);
+    ASSERT_TRUE(tu_header(resp2, "\r\nETag: ", etag2, sizeof(etag2)));
+    ASSERT_STR_EQ(etag1, etag2);
+
+    char req304[256];
+    snprintf(req304, sizeof(req304),
+             "GET /api/layout.bin?project=etagtest HTTP/1.1\r\n"
+             "If-None-Match: %s\r\n\r\n",
+             etag1);
+    int n3 = tu_http(port, req304, resp3, sizeof(resp3));
+    ASSERT_GT(n3, 0);
+    ASSERT_EQ(tu_status(resp3), 304);
+    ASSERT_NOT_NULL(strstr(resp3, "\r\nETag: "));
+    ASSERT_NOT_NULL(strstr(resp3, "Content-Length: 0"));
+    /* no body: the response ends right after the header terminator */
+    const char *sep = strstr(resp3, "\r\n\r\n");
+    ASSERT_NOT_NULL(sep);
+    ASSERT_EQ((long long)(sep + 4 - resp3), (long long)n3);
+
+    cbm_http_server_stop(srv);
+    cbm_thread_join(&tid);
+    cbm_http_server_free(srv);
+
+    if (old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+        free(old_cache);
+    } else {
+        cbm_setenv("CBM_CACHE_DIR", "", 1);
+    }
     PASS();
 }
 
@@ -435,5 +867,12 @@ SUITE(ui) {
     RUN_TEST(layout_respects_max_nodes);
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
+    RUN_TEST(layout_to_binary_roundtrip);
+    RUN_TEST(layout_to_binary_empty);
+    RUN_TEST(layout_overview_filters_low_degree);
+    RUN_TEST(layout_overview_fallback_when_no_hubs);
     RUN_TEST(layout_null_inputs);
+
+    /* /api/layout.bin blob cache + ETag */
+    RUN_TEST(layout_bin_etag_and_cache);
 }

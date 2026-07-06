@@ -23,8 +23,13 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
-#define DEFAULT_MAX_NODES 50000
+/* No hard cap — pass max_nodes <= 0 to fetch every node in the project.
+ * The renderer (graph-ui) handles 1M+ via instanced/typed-array streaming. */
+#define DEFAULT_MAX_NODES 0 /* 0 → unbounded; store query treats <=0 as no limit */
 #define BH_THETA 1.2f
+
+/* OVERVIEW keeps only nodes with degree >= this (hub-only preview). */
+#define OVERVIEW_MIN_DEGREE 2
 
 /* Local optimization: gentle, preserves structure */
 #define LOCAL_REPULSION 8.0f
@@ -387,18 +392,19 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         int radius, int max_nodes) {
     if (!store || !project)
         return NULL;
-    if (max_nodes <= 0)
-        max_nodes = DEFAULT_MAX_NODES;
     (void)center_node;
     (void)radius;
-    (void)level;
 
-    /* 1. Query nodes */
+    /* 1. Query nodes.
+     * Store treats limit==0 as "default 10". Use INT32_MAX when caller
+     * asked for unbounded so we actually get every row.
+     * OVERVIEW filters to min_degree >= 2 so huge graphs return a small
+     * hub-only preview while the full DETAIL payload is being built. */
     cbm_search_params_t params;
     memset(&params, 0, sizeof(params));
     params.project = project;
-    params.limit = max_nodes;
-    params.min_degree = -1;
+    params.limit = (max_nodes > 0) ? max_nodes : 0x7fffffff;
+    params.min_degree = (level == CBM_LAYOUT_OVERVIEW) ? OVERVIEW_MIN_DEGREE : -1;
     params.max_degree = -1;
 
     cbm_search_output_t search_out;
@@ -407,6 +413,24 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
 
     int n = search_out.count, total_count = search_out.total;
+    if (level == CBM_LAYOUT_OVERVIEW) {
+        /* Under the degree filter search_out.total counts only hubs, but
+         * total_nodes is documented as "total in project before any cap".
+         * The unfiltered count also gates the empty-preview fallback. */
+        int project_total = cbm_store_count_nodes(store, project);
+        if (project_total > total_count)
+            total_count = project_total;
+        if (n == 0 && project_total > 0) {
+            /* Tiny project where no node reaches degree >= 2 — refetch
+             * unfiltered so the preview is never empty. */
+            cbm_store_search_free(&search_out);
+            memset(&search_out, 0, sizeof(search_out));
+            params.min_degree = -1;
+            if (cbm_store_search(store, &params, &search_out) != CBM_STORE_OK)
+                return calloc(CBM_ALLOC_ONE, sizeof(cbm_layout_result_t));
+            n = search_out.count;
+        }
+    }
     if (n == 0) {
         cbm_store_search_free(&search_out);
         cbm_layout_result_t *r = calloc(CBM_ALLOC_ONE, sizeof(*r));
@@ -580,13 +604,17 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         result->nodes[i].z = bodies[i].z;
     }
 
-    /* 8. Output edges */
+    /* 8. Output edges — node ids for the JSON serializer, node indices for
+     * the binary v2 serializer (es/ed are already indices into the node
+     * arrays, validated by the binary-search filter in step 3). */
     if (mapped > 0) {
         result->edges = calloc((size_t)mapped, sizeof(cbm_layout_edge_t));
         result->edge_count = mapped;
         for (int e = 0; e < mapped && result->edges; e++) {
             result->edges[e].source = search_out.results[es[e]].node.id;
             result->edges[e].target = search_out.results[ed[e]].node.id;
+            result->edges[e].source_idx = es[e];
+            result->edges[e].target_idx = ed[e];
             result->edges[e].type = all_edges[e].type ? strdup(all_edges[e].type) : NULL;
         }
     }
@@ -615,6 +643,356 @@ void cbm_layout_free(cbm_layout_result_t *r) {
         free((void *)r->edges[i].type);
     free(r->edges);
     free(r);
+}
+
+/* ── Binary serializer ────────────────────────────────────────────
+ *
+ * Layout shape documented in layout3d.h. Highlights:
+ *  - Struct-of-arrays so the frontend can map sections straight onto
+ *    typed-array views and hand the position buffer to the GPU.
+ *  - Label/edge-type strings are deduplicated into a u8 index (max 255).
+ *  - name/path/qn are interned with a small hash table so repeated file
+ *    paths and shared symbol names don't bloat the payload at 1M nodes.
+ *  - Byte offset 0 in the strings block is the sentinel "absent" — readers
+ *    must check for it. */
+
+/* Power-of-two open-addressing hash table over interned strings.
+ * Keys are NUL-terminated; values are u32 byte offsets into the strings
+ * buffer. We use FNV-1a + linear probing — collisions are rare at our scale
+ * (typical: ~10k unique names, table sized 64k). */
+typedef struct {
+    uint32_t hash;
+    uint32_t off; /* 0 = empty slot */
+} intern_slot_t;
+
+typedef struct {
+    char *bytes;
+    size_t len;
+    size_t cap;
+    intern_slot_t *slots;
+    size_t slot_mask; /* slot_count - 1, always power of two */
+} intern_t;
+
+static void intern_init(intern_t *it, size_t slot_count) {
+    it->cap = 4096;
+    it->bytes = malloc(it->cap);
+    if (it->bytes) {
+        it->bytes[0] = '\0';
+    }
+    it->len = 1; /* reserve offset 0 for the "absent" sentinel */
+    it->slot_mask = slot_count - 1;
+    it->slots = calloc(slot_count, sizeof(intern_slot_t));
+}
+
+static void intern_free(intern_t *it) {
+    free(it->bytes);
+    free(it->slots);
+}
+
+static uint32_t intern_add(intern_t *it, const char *s) {
+    if (!s || !*s)
+        return 0;
+    if (!it->bytes || !it->slots)
+        return 0;
+    size_t l = strlen(s);
+    /* FNV-1a 32-bit */
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < l; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    if (h == 0)
+        h = 1; /* keep 0 distinguishable from "empty slot" */
+
+    size_t mask = it->slot_mask;
+    size_t i = h & mask;
+    for (size_t probes = 0; probes <= mask; probes++) {
+        intern_slot_t *slot = &it->slots[i];
+        if (slot->off == 0) {
+            /* Insert */
+            if (it->len + l + 1 > it->cap) {
+                size_t nc = it->cap;
+                while (it->len + l + 1 > nc)
+                    nc *= 2;
+                char *nb = realloc(it->bytes, nc);
+                if (!nb)
+                    return 0;
+                it->bytes = nb;
+                it->cap = nc;
+            }
+            uint32_t off = (uint32_t)it->len;
+            memcpy(it->bytes + it->len, s, l + 1);
+            it->len += l + 1;
+            slot->hash = h;
+            slot->off = off;
+            return off;
+        }
+        if (slot->hash == h && strcmp(it->bytes + slot->off, s) == 0) {
+            return slot->off;
+        }
+        i = (i + 1) & mask;
+    }
+    return 0; /* table full — extremely unlikely with 64k slots */
+}
+
+/* Pick a hash-table size proportional to expected unique-string count.
+ * We size for ~50% load factor. */
+static size_t intern_slots_for(int node_count) {
+    size_t hint = (size_t)(node_count > 0 ? node_count : 1) * 3;
+    size_t s = 1024;
+    while (s < hint)
+        s <<= 1;
+    if (s > (1u << 20))
+        s = 1u << 20;
+    return s;
+}
+
+/* Look up `s` in a small (<= 255 entries) string array. Returns the existing
+ * index or appends and returns the new one. Returns -1 only on overflow. */
+static int small_intern(const char **arr, uint8_t *count, const char *s) {
+    if (!s)
+        s = "";
+    for (int j = 0; j < *count; j++) {
+        if (strcmp(arr[j], s) == 0)
+            return j;
+    }
+    if (*count >= 255)
+        return -1;
+    arr[*count] = s;
+    return (*count)++;
+}
+
+void *cbm_layout_to_binary(const cbm_layout_result_t *r, size_t *out_size) {
+    if (!r || !out_size)
+        return NULL;
+    *out_size = 0;
+
+    int n = r->node_count;
+    int e = r->edge_count;
+
+    /* ── 1. Build label + edge-type indices ─────────────────────── */
+    const char *labels[256];
+    uint8_t labels_ct = 0;
+    const char *etypes[256];
+    uint8_t etypes_ct = 0;
+
+    uint8_t *node_label_id = n > 0 ? malloc((size_t)n) : NULL;
+    uint8_t *edge_etype_id = e > 0 ? malloc((size_t)e) : NULL;
+    if ((n > 0 && !node_label_id) || (e > 0 && !edge_etype_id)) {
+        free(node_label_id);
+        free(edge_etype_id);
+        return NULL;
+    }
+
+    for (int i = 0; i < n; i++) {
+        int id = small_intern(labels, &labels_ct, r->nodes[i].label);
+        node_label_id[i] = (uint8_t)(id < 0 ? 0 : id);
+    }
+    for (int i = 0; i < e; i++) {
+        int id = small_intern(etypes, &etypes_ct, r->edges[i].type);
+        edge_etype_id[i] = (uint8_t)(id < 0 ? 0 : id);
+    }
+
+    /* ── 2. Intern name/path/qn into the strings byte block ──────── */
+    intern_t it;
+    intern_init(&it, intern_slots_for(n));
+    if (!it.bytes || !it.slots) {
+        intern_free(&it);
+        free(node_label_id);
+        free(edge_etype_id);
+        return NULL;
+    }
+
+    uint32_t *name_off = n > 0 ? malloc((size_t)n * sizeof(uint32_t)) : NULL;
+    uint32_t *path_off = n > 0 ? malloc((size_t)n * sizeof(uint32_t)) : NULL;
+    uint32_t *qn_off = n > 0 ? malloc((size_t)n * sizeof(uint32_t)) : NULL;
+    if (n > 0 && (!name_off || !path_off || !qn_off)) {
+        free(name_off);
+        free(path_off);
+        free(qn_off);
+        intern_free(&it);
+        free(node_label_id);
+        free(edge_etype_id);
+        return NULL;
+    }
+    for (int i = 0; i < n; i++) {
+        name_off[i] = intern_add(&it, r->nodes[i].name);
+        path_off[i] = intern_add(&it, r->nodes[i].file_path);
+        qn_off[i] = intern_add(&it, r->nodes[i].qualified_name);
+    }
+
+    /* Also intern label + etype strings so they live in the same byte block
+     * (parser only needs one base pointer). */
+    uint32_t label_str_off[256] = {0};
+    uint32_t etype_str_off[256] = {0};
+    for (int j = 0; j < labels_ct; j++)
+        label_str_off[j] = intern_add(&it, labels[j]);
+    for (int j = 0; j < etypes_ct; j++)
+        etype_str_off[j] = intern_add(&it, etypes[j]);
+
+    /* ── 3. Compute layout: header + sections + strings ──────────── */
+    size_t header_size = 32;
+    size_t sec_node_ids = (size_t)n * 8;
+    size_t sec_edge_src = (size_t)e * 4; /* v2: u32 node indices, not i64 ids */
+    size_t sec_edge_tgt = (size_t)e * 4;
+    size_t sec_positions = (size_t)n * 12;
+    size_t sec_sizes = (size_t)n * 4;
+    size_t sec_colors = (size_t)n * 4;
+    size_t sec_name_off = (size_t)n * 4;
+    size_t sec_path_off = (size_t)n * 4;
+    size_t sec_qn_off = (size_t)n * 4;
+    size_t sec_node_lbl = (size_t)n;
+    size_t sec_edge_etype = (size_t)e;
+    /* The u8 sections (node_lbl + edge_etype) end at an arbitrary byte; the
+     * following u32 sections require 4-byte alignment. Insert a pad so the
+     * frontend can wrap the strings tables as Uint32Array views directly. */
+    size_t pre_u32_pad =
+        (4 - ((sec_node_lbl + sec_edge_etype) & 3u)) & 3u;
+    size_t sec_label_idx = (size_t)labels_ct * 4;
+    size_t sec_etype_idx = (size_t)etypes_ct * 4;
+    size_t sec_strings = it.len;
+
+    /* Pad strings table up to 4-byte alignment so total length stays nice. */
+    size_t strings_padded = (sec_strings + 3) & ~(size_t)3;
+
+    size_t total =
+        header_size + sec_node_ids + sec_edge_src + sec_edge_tgt + sec_positions + sec_sizes +
+        sec_colors + sec_name_off + sec_path_off + sec_qn_off + sec_node_lbl + sec_edge_etype +
+        pre_u32_pad + sec_label_idx + sec_etype_idx + strings_padded;
+
+    uint8_t *buf = malloc(total);
+    if (!buf) {
+        free(name_off);
+        free(path_off);
+        free(qn_off);
+        intern_free(&it);
+        free(node_label_id);
+        free(edge_etype_id);
+        return NULL;
+    }
+    memset(buf, 0, total);
+    uint8_t *p = buf;
+
+    /* Header (little-endian; we assume LE host, which matches every platform
+     * this project supports — macOS/Linux/Windows on x86_64 and arm64). */
+#define WRITE_U32(P, V)                                                                            \
+    do {                                                                                           \
+        uint32_t _v = (uint32_t)(V);                                                               \
+        memcpy((P), &_v, 4);                                                                       \
+    } while (0)
+    WRITE_U32(p + 0, 0x4C414233u); /* 'LAB3' */
+    WRITE_U32(p + 4, 2u);          /* v2: edge endpoints are u32 node indices */
+    WRITE_U32(p + 8, (uint32_t)n);
+    WRITE_U32(p + 12, (uint32_t)e);
+    WRITE_U32(p + 16, (uint32_t)r->total_nodes);
+    WRITE_U32(p + 20, (uint32_t)strings_padded);
+    WRITE_U32(p + 24, (uint32_t)labels_ct);
+    WRITE_U32(p + 28, (uint32_t)etypes_ct);
+    p += header_size;
+
+    /* Node IDs (int64) */
+    for (int i = 0; i < n; i++) {
+        int64_t v = r->nodes[i].id;
+        memcpy(p, &v, 8);
+        p += 8;
+    }
+
+    /* Edge src + tgt node indices (uint32). cbm_layout_compute always emits
+     * indices in [0, node_count); clamp defensively so a malformed result
+     * can never make the frontend read past its node arrays. */
+    for (int i = 0; i < e; i++) {
+        uint32_t v = (uint32_t)r->edges[i].source_idx;
+        if (r->edges[i].source_idx < 0 || r->edges[i].source_idx >= n)
+            v = 0;
+        WRITE_U32(p, v);
+        p += 4;
+    }
+    for (int i = 0; i < e; i++) {
+        uint32_t v = (uint32_t)r->edges[i].target_idx;
+        if (r->edges[i].target_idx < 0 || r->edges[i].target_idx >= n)
+            v = 0;
+        WRITE_U32(p, v);
+        p += 4;
+    }
+
+    /* Positions (float32 × 3 per node) */
+    for (int i = 0; i < n; i++) {
+        float xyz[3] = {r->nodes[i].x, r->nodes[i].y, r->nodes[i].z};
+        for (int j = 0; j < 3; j++) {
+            if (!isfinite(xyz[j]))
+                xyz[j] = 0.0f;
+        }
+        memcpy(p, xyz, 12);
+        p += 12;
+    }
+
+    /* Sizes (float32) */
+    for (int i = 0; i < n; i++) {
+        float sz = r->nodes[i].size;
+        if (!isfinite(sz))
+            sz = 1.0f;
+        memcpy(p, &sz, 4);
+        p += 4;
+    }
+
+    /* Colors (uint32) */
+    for (int i = 0; i < n; i++) {
+        WRITE_U32(p, r->nodes[i].color);
+        p += 4;
+    }
+
+    /* Per-node string offsets (uint32) */
+    if (n > 0)
+        memcpy(p, name_off, sec_name_off);
+    p += sec_name_off;
+    if (n > 0)
+        memcpy(p, path_off, sec_path_off);
+    p += sec_path_off;
+    if (n > 0)
+        memcpy(p, qn_off, sec_qn_off);
+    p += sec_qn_off;
+
+    /* Per-node label id (uint8) */
+    if (n > 0)
+        memcpy(p, node_label_id, sec_node_lbl);
+    p += sec_node_lbl;
+
+    /* Per-edge type id (uint8) */
+    if (e > 0)
+        memcpy(p, edge_etype_id, sec_edge_etype);
+    p += sec_edge_etype;
+
+    /* Align to 4 bytes for the following u32 sections (buf was zeroed). */
+    p += pre_u32_pad;
+
+    /* Label string offsets (uint32) */
+    for (int j = 0; j < labels_ct; j++) {
+        WRITE_U32(p, label_str_off[j]);
+        p += 4;
+    }
+
+    /* Edge-type string offsets (uint32) */
+    for (int j = 0; j < etypes_ct; j++) {
+        WRITE_U32(p, etype_str_off[j]);
+        p += 4;
+    }
+
+    /* Strings bytes (NUL-terminated, offset 0 = absent) */
+    if (it.len > 0)
+        memcpy(p, it.bytes, it.len);
+    /* Trailing alignment padding is already zeroed by the calloc-like memset. */
+
+#undef WRITE_U32
+
+    free(name_off);
+    free(path_off);
+    free(qn_off);
+    intern_free(&it);
+    free(node_label_id);
+    free(edge_etype_id);
+
+    *out_size = total;
+    return buf;
 }
 
 char *cbm_layout_to_json(const cbm_layout_result_t *r) {

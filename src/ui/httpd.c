@@ -332,6 +332,8 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
 
         if (header_name_is(p, nlen, "origin")) {
             copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin));
+        } else if (header_name_is(p, nlen, "if-none-match")) {
+            copy_header_value(colon + 1, eol, req->if_none_match, sizeof(req->if_none_match));
         } else if (header_name_is(p, nlen, "transfer-encoding")) {
             /* Chunked (or any transfer coding) is not supported. */
             return 411;
@@ -479,6 +481,8 @@ static const char *status_reason(int status) {
         return "Accepted";
     case 204:
         return "No Content";
+    case 304:
+        return "Not Modified";
     case 400:
         return "Bad Request";
     case 403:
