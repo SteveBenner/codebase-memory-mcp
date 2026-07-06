@@ -19,16 +19,27 @@
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include "watcher/watcher.h"
+#include "cli/cli.h"
+#include "git/git_context.h"
+
+#if defined(HAVE_LIBGIT2)
+#include <git2.h> /* git_repository_open, git_remote_lookup, git_remote_url */
+#endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
+#include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
+#include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -40,6 +51,7 @@
 #include <process.h>
 #include <psapi.h> /* GetProcessMemoryInfo */
 #else
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #endif
@@ -80,11 +92,39 @@ static void update_cors(const cbm_http_req_t *req) {
     snprintf(g_cors_json, sizeof(g_cors_json), "%sContent-Type: application/json\r\n", g_cors);
 }
 
+static const char *detect_ui_lang(const char *accept_language) {
+    if (accept_language && (strstr(accept_language, "zh-CN") || strstr(accept_language, "zh"))) {
+        return "zh";
+    }
+    return "en";
+}
+
+static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    const char *lang = NULL;
+    char cache_dir[1024];
+    snprintf(cache_dir, sizeof(cache_dir), "%s", cbm_resolve_cache_dir());
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    if (cfg) {
+        const char *pinned = cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto");
+        if (strcmp(pinned, "zh") == 0 || strcmp(pinned, "en") == 0) {
+            lang = pinned;
+        }
+    }
+
+    char lang_buf[8];
+    snprintf(lang_buf, sizeof(lang_buf), "%s", lang ? lang : detect_ui_lang(req->accept_language));
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\"}", lang_buf);
+}
+
 /* ── Server state ─────────────────────────────────────────────── */
 
 struct cbm_http_server {
     cbm_httpd_t *listener;
-    cbm_mcp_server_t *mcp; /* own MCP server instance (read-only) */
+    cbm_mcp_server_t *mcp;       /* own MCP server instance (read-only) */
+    struct cbm_watcher *watcher; /* external watcher ref (not owned) */
     atomic_int stop_flag;
     int port;
     bool listener_ok;
@@ -135,6 +175,171 @@ static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
         dir = cbm_tmpdir();
     }
     snprintf(buf, bufsz, "%s/%s.db", dir, project);
+}
+
+/* ── Git remote → GitHub deep-link base (/api/repo-info) ───────── */
+
+/* Return a copy of `url` with any "user[:password]@" userinfo removed from the
+ * scheme://authority form, so credentials are never echoed back to the client.
+ * scp-style (git@host:path) is returned unchanged: "git" there is a login name,
+ * not a secret. malloc'd copy, or NULL when url is NULL. Caller frees. */
+char *cbm_ui_git_strip_credentials(const char *url) {
+    if (!url)
+        return NULL;
+    const char *sep = strstr(url, "://");
+    if (!sep)
+        return strdup(url); /* scp-style / opaque — no scheme userinfo to strip */
+    const char *authority = sep + 3;
+    const char *slash = strchr(authority, '/');
+    const char *at = strchr(authority, '@');
+    if (!at || (slash && at > slash))
+        return strdup(url); /* '@' is in the path, not the authority → no creds */
+    size_t prefix = (size_t)(authority - url); /* "scheme://" */
+    const char *rest = at + 1;
+    size_t out_len = prefix + strlen(rest) + 1;
+    char *out = malloc(out_len);
+    if (!out)
+        return NULL;
+    memcpy(out, url, prefix);
+    memcpy(out + prefix, rest, strlen(rest) + 1);
+    return out;
+}
+
+/* Normalize a git remote URL (scp-style, ssh://, https://) to a canonical
+ * "https://host/org/repo" web base with any trailing ".git" and any embedded
+ * credentials removed. Returns a malloc'd string or NULL if the shape isn't
+ * recognized. Caller frees. */
+char *cbm_ui_git_web_base(const char *url) {
+    if (!url || !url[0])
+        return NULL;
+    char host_path[1024] = {0}; /* "host/org/repo" */
+    if (strncmp(url, "git@", 4) == 0) {
+        const char *at = url + 4;
+        const char *colon = strchr(at, ':');
+        if (!colon)
+            return NULL;
+        snprintf(host_path, sizeof(host_path), "%.*s/%s", (int)(colon - at), at, colon + 1);
+    } else {
+        const char *p = strstr(url, "://");
+        if (!p)
+            return NULL;
+        p += 3;
+        const char *at = strchr(p, '@'); /* strip any embedded credentials */
+        if (at)
+            p = at + 1;
+        snprintf(host_path, sizeof(host_path), "%s", p);
+    }
+    size_t l = strlen(host_path);
+    if (l > 4 && strcmp(host_path + l - 4, ".git") == 0)
+        host_path[l - 4] = '\0';
+    l = strlen(host_path);
+    if (l > 0 && host_path[l - 1] == '/')
+        host_path[l - 1] = '\0';
+    size_t out_sz = strlen(host_path) + 9; /* "https://" (8) + NUL */
+    char *out = malloc(out_sz);
+    if (!out)
+        return NULL;
+    /* Legitimate GitHub blob-URL construction, not a network call — the scheme
+     * is https-forced here so the frontend deep-link can never be downgraded.
+     * Allow-listed in scripts/security-allowlist.txt (URL:https://%s). */
+    snprintf(out, out_sz, "https://%s", host_path);
+    return out;
+}
+
+/* Read the "origin" remote URL for the repo at root_path. malloc'd or NULL.
+ * libgit2 is initialized once at process start by cbm_alloc_init() (which also
+ * binds its allocator to mimalloc) — do NOT git_libgit2_init()/shutdown() here:
+ * a per-request shutdown could drop the global refcount and tear down that
+ * allocator binding mid-process. */
+static char *git_origin_remote_url(const char *root_path) {
+#if defined(HAVE_LIBGIT2)
+    git_repository *repo = NULL;
+    char *out = NULL;
+    if (git_repository_open(&repo, root_path) == 0) {
+        git_remote *rem = NULL;
+        if (git_remote_lookup(&rem, repo, "origin") == 0) {
+            const char *u = git_remote_url(rem);
+            if (u)
+                out = strdup(u);
+            git_remote_free(rem);
+        }
+        git_repository_free(repo);
+    }
+    return out;
+#else
+    (void)root_path;
+    return NULL;
+#endif
+}
+
+/* GET /api/repo-info?project=NAME → { root_path, branch, remote_url, web_base,
+ * blob_base }. blob_base is "<web_base>/blob/<branch>" ready for the frontend to
+ * append "/<file_path>#L<start>-L<end>". remote_url is credential-stripped;
+ * fields are empty strings when unknown (e.g. no git remote). */
+static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    if (!cbm_http_query_param(req->query, "project", project, (int)sizeof(project)) ||
+        project[0] == '\0') {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
+        return;
+    }
+
+    char db_path[1024];
+    db_path_for_project(project, db_path, sizeof(db_path));
+    if (db_path[0] == '\0' || !cbm_file_exists(db_path)) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
+        return;
+    }
+
+    char root_path[1024] = {0};
+    cbm_project_t proj;
+    memset(&proj, 0, sizeof(proj));
+    if (cbm_store_get_project(store, project, &proj) == CBM_STORE_OK && proj.root_path) {
+        snprintf(root_path, sizeof(root_path), "%s", proj.root_path);
+    }
+    cbm_project_free_fields(&proj);
+    cbm_store_close(store);
+
+    char branch[256] = {0};
+    if (root_path[0]) {
+        cbm_git_context_t gctx;
+        memset(&gctx, 0, sizeof(gctx));
+        if (cbm_git_context_resolve(root_path, &gctx) == 0 && gctx.branch) {
+            snprintf(branch, sizeof(branch), "%s", gctx.branch);
+        }
+        cbm_git_context_free(&gctx);
+    }
+
+    char *remote = root_path[0] ? git_origin_remote_url(root_path) : NULL;
+    char *remote_safe = cbm_ui_git_strip_credentials(remote); /* never echo secrets */
+    char *web_base = cbm_ui_git_web_base(remote);
+
+    char blob_base[1152] = {0};
+    if (web_base && web_base[0] && branch[0]) {
+        snprintf(blob_base, sizeof(blob_base), "%s/blob/%s", web_base, branch);
+    }
+
+    /* JSON-escape the free-form fields. */
+    char esc_root[2048], esc_branch[512], esc_remote[2048], esc_web[2048], esc_blob[2304];
+    cbm_json_escape(esc_root, (int)sizeof(esc_root), root_path);
+    cbm_json_escape(esc_branch, (int)sizeof(esc_branch), branch);
+    cbm_json_escape(esc_remote, (int)sizeof(esc_remote), remote_safe ? remote_safe : "");
+    cbm_json_escape(esc_web, (int)sizeof(esc_web), web_base ? web_base : "");
+    cbm_json_escape(esc_blob, (int)sizeof(esc_blob), blob_base);
+
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"root_path\":\"%s\",\"branch\":\"%s\",\"remote_url\":\"%s\","
+                    "\"web_base\":\"%s\",\"blob_base\":\"%s\"}",
+                    esc_root, esc_branch, esc_remote, esc_web, esc_blob);
+
+    free(remote);
+    free(remote_safe);
+    free(web_base);
 }
 
 /* ── Log ring buffer ──────────────────────────────────────────── */
@@ -397,6 +602,26 @@ static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 #include <dirent.h>
 
+static void append_roots_json(char *buf, size_t bufsz, int *pos) {
+    *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, ",\"roots\":[");
+#ifdef _WIN32
+    DWORD drives = GetLogicalDrives();
+    int count = 0;
+    for (int i = 0; i < 26; i++) {
+        if (!(drives & (1u << i))) {
+            continue;
+        }
+        if (count++ > 0) {
+            buf[(*pos)++] = ',';
+        }
+        *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "\"%c:/\"", 'A' + i);
+    }
+#else
+    *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "\"/\"");
+#endif
+    *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "]");
+}
+
 /* GET /api/browse?path=/some/dir — list subdirectories for file picker */
 static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char path[1024] = {0};
@@ -408,6 +633,12 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         else
             snprintf(path, sizeof(path), "/");
     }
+
+    /* The browser UI may send Windows backslash separators (e.g.
+     * "D:\projects\demo"). Normalize to forward slashes before the cbm_is_dir
+     * gate, exactly as the MCP repo_path handler and cbm_project_name_from_path
+     * already do — otherwise a real D:/ directory is rejected (#548). */
+    cbm_normalize_path_sep(path);
 
     if (!cbm_is_dir(path)) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"not a directory\"}");
@@ -460,15 +691,25 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char parent[1024];
     snprintf(parent, sizeof(parent), "%s", path);
     char *last_slash = strrchr(parent, '/');
-    if (last_slash && last_slash != parent)
+    /* A Windows drive root "X:/" is its own parent (like POSIX "/"): truncating
+     * at the slash would yield the bare drive spec "X:", which the next browse
+     * resolves to the wrong directory and strands the user at the root (#548). */
+    size_t parent_len = strlen(parent);
+    bool is_drive_root = parent_len == 3 && parent[1] == ':' && parent[2] == '/';
+    if (is_drive_root) {
+        /* leave "X:/" unchanged */
+    } else if (last_slash && last_slash != parent) {
         *last_slash = '\0';
-    else
+    } else {
         snprintf(parent, sizeof(parent), "/");
+    }
 
     {
         char esc_parent[2048];
         cbm_json_escape(esc_parent, (int)sizeof(esc_parent), parent);
-        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "],\"parent\":\"%s\"}", esc_parent);
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "],\"parent\":\"%s\"", esc_parent);
+        append_roots_json(buf, sizeof(buf), &pos);
+        pos += snprintf(buf + pos, sizeof(buf) - (size_t)pos, "}");
     }
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -583,9 +824,107 @@ static void handle_adr_save(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
 static char g_binary_path[1024] = {0};
 
+static bool copy_path(char *out, size_t outsz, const char *path) {
+    if (!out || outsz == 0 || !path || !path[0]) {
+        return false;
+    }
+    int n = snprintf(out, outsz, "%s", path);
+    return n > 0 && (size_t)n < outsz;
+}
+
+#ifndef _WIN32
+static bool is_executable_file(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+
+static bool resolve_from_path(const char *name, char *out, size_t outsz) {
+    const char *path = getenv("PATH");
+    if (!name || !name[0] || strchr(name, '/') || !path || !path[0]) {
+        return false;
+    }
+
+    const char *cur = path;
+    while (*cur) {
+        const char *colon = strchr(cur, ':');
+        size_t dir_len = colon ? (size_t)(colon - cur) : strlen(cur);
+        if (dir_len > 0 && dir_len < 900) {
+            char candidate[1024];
+            int n = snprintf(candidate, sizeof(candidate), "%.*s/%s", (int)dir_len, cur, name);
+            if (n > 0 && (size_t)n < sizeof(candidate) && is_executable_file(candidate)) {
+                return copy_path(out, outsz, candidate);
+            }
+        }
+        if (!colon) {
+            break;
+        }
+        cur = colon + 1;
+    }
+    return false;
+}
+
+static bool resolve_self_executable(char *out, size_t outsz) {
+#if defined(__APPLE__)
+    char buf[1024];
+    uint32_t sz = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &sz) == 0 && buf[0]) {
+        return copy_path(out, outsz, buf);
+    }
+    return false;
+#else
+    char buf[1024];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len > 0) {
+        buf[len] = '\0';
+        return copy_path(out, outsz, buf);
+    }
+    return false;
+#endif
+}
+#else
+static bool resolve_self_executable(char *out, size_t outsz) {
+    char buf[1024];
+    DWORD n = GetModuleFileNameA(NULL, buf, (DWORD)sizeof(buf));
+    if (n > 0 && n < sizeof(buf)) {
+        return copy_path(out, outsz, buf);
+    }
+    return false;
+}
+#endif
+
+bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz) {
+    if (!out || outsz == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+#ifndef _WIN32
+    if (argv0 && strchr(argv0, '/') && is_executable_file(argv0)) {
+        return copy_path(out, outsz, argv0);
+    }
+    if (resolve_from_path(argv0, out, outsz)) {
+        return true;
+    }
+#else
+    if (argv0 && argv0[0]) {
+        DWORD attrs = GetFileAttributesA(argv0);
+        if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+            return copy_path(out, outsz, argv0);
+        }
+    }
+#endif
+
+    if (resolve_self_executable(out, outsz)) {
+        return true;
+    }
+    return copy_path(out, outsz, argv0);
+}
+
 void cbm_http_server_set_binary_path(const char *path) {
     if (path) {
-        snprintf(g_binary_path, sizeof(g_binary_path), "%s", path);
+        if (!cbm_http_server_resolve_binary_path(path, g_binary_path, sizeof(g_binary_path))) {
+            g_binary_path[0] = '\0';
+        }
     }
 }
 
@@ -598,57 +937,67 @@ static void *index_thread_fn(void *arg) {
     const char *bin = g_binary_path;
     char self_path[1024] = {0};
     if (!bin[0]) {
-#ifdef _WIN32
-        GetModuleFileNameA(NULL, self_path, sizeof(self_path));
-#elif defined(__APPLE__)
-        uint32_t sz = sizeof(self_path);
-        _NSGetExecutablePath(self_path, &sz);
-#else
-        ssize_t len = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
-        if (len > 0)
-            self_path[len] = '\0';
-#endif
+        cbm_http_server_resolve_binary_path(NULL, self_path, sizeof(self_path));
         bin = self_path[0] ? self_path : "codebase-memory-mcp";
     }
 
     char log_file[256];
 
-    /* JSON-escape root_path to prevent injection via double-quotes or backslashes */
+    /* JSON-escape root_path and optional project name. */
     char escaped_path[2048];
-    {
-        const char *s = job->root_path;
-        size_t j = 0;
-        for (; *s && j < sizeof(escaped_path) - 2; s++) {
-            if (*s == '"' || *s == '\\') {
-                escaped_path[j++] = '\\';
-            }
-            escaped_path[j++] = *s;
-        }
-        escaped_path[j] = '\0';
-    }
+    cbm_json_escape(escaped_path, (int)sizeof(escaped_path), job->root_path);
+    char escaped_name[512];
+    cbm_json_escape(escaped_name, (int)sizeof(escaped_name), job->project_name);
     char json_arg[4096];
-    snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
+    if (job->project_name[0]) {
+        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\",\"name\":\"%s\"}", escaped_path,
+                 escaped_name);
+    } else {
+        snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
+    }
 
 #ifdef _WIN32
     snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
              getenv("TEMP") ? getenv("TEMP") : ".", (int)_getpid());
 
-    /* Build command line for CreateProcess */
+    /* Build command line for CreateProcess through the shared MS-CRT quoter so the
+     * JSON arg's embedded quotes survive the child's argv re-parse — a naive
+     * `"%s"` wrap dropped them, corrupting {"repo_path":"…"} into {repo_path:…}.
+     * --index-worker: this http_server spawn is already the crash-isolation layer,
+     * so the child runs indexing in-process rather than spawning its own supervisor
+     * (avoids redundant process nesting). */
     char cmdline[2048];
-    snprintf(cmdline, sizeof(cmdline), "\"%s\" cli index_repository \"%s\"", bin, json_arg);
+    const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
+                                    json_arg, NULL};
+    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), idx_argv)) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "index command line too long");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
+    /* Wide command line: CreateProcessA would re-mangle the UTF-8 repo path through the
+     * ANSI code page at the spawn boundary, so a non-ASCII repo path never reaches the
+     * worker intact (#423/#20). Convert and spawn via CreateProcessW. */
+    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
+    if (!wcmd) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "index command line conversion failed");
+        atomic_store(&job->status, 3);
+        return NULL;
+    }
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
     HANDLE hlog = CreateFileA(log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOA si_proc = {.cb = sizeof(si_proc)};
+    STARTUPINFOW si_proc = {.cb = sizeof(si_proc)};
     if (hlog != INVALID_HANDLE_VALUE) {
         si_proc.dwFlags = STARTF_USESTDHANDLES;
         si_proc.hStdError = hlog;
         si_proc.hStdOutput = hlog;
     }
     PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi)) {
+    BOOL spawned = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi);
+    free(wcmd);
+    if (!spawned) {
         snprintf(job->error_msg, sizeof(job->error_msg), "CreateProcess failed");
         atomic_store(&job->status, 3);
         if (hlog != INVALID_HANDLE_VALUE)
@@ -703,7 +1052,7 @@ static void *index_thread_fn(void *arg) {
         FILE *lf = freopen(log_file, "w", stderr);
         (void)lf;
         freopen("/dev/null", "w", stdout);
-        execl(bin, bin, "cli", "index_repository", json_arg, (char *)NULL);
+        execl(bin, bin, "cli", "--index-worker", "index_repository", json_arg, (char *)NULL);
         _exit(127);
     }
 
@@ -753,7 +1102,7 @@ static void *index_thread_fn(void *arg) {
     return NULL;
 }
 
-/* POST /api/index — body: {"root_path": "/abs/path"} → starts background indexing */
+/* POST /api/index — body: {"root_path": "/abs/path", "project_name": "..."} */
 static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     if (req->body_len == 0 || req->body_len > 4096) {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
@@ -773,6 +1122,8 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
     const char *rpath = yyjson_get_str(v_path);
+    yyjson_val *v_project_name = yyjson_obj_get(root, "project_name");
+    const char *project_name = yyjson_is_str(v_project_name) ? yyjson_get_str(v_project_name) : "";
 
     /* Check path exists */
     if (!cbm_is_dir(rpath)) {
@@ -798,6 +1149,7 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     index_job_t *job = &g_index_jobs[slot];
     snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
+    snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
     job->error_msg[0] = '\0';
     atomic_store(&job->status, 1);
     yyjson_doc_free(doc);
@@ -836,8 +1188,15 @@ static void handle_index_status(cbm_http_conn_t *c) {
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
+static void unwatch_project(cbm_http_server_t *srv, const char *name) {
+    if (srv && srv->watcher) {
+        cbm_watcher_unwatch(srv->watcher, name);
+    }
+}
+
 /* DELETE /api/project?name=X — deletes the .db file */
-static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                                  const cbm_http_req_t *req) {
     char name[256] = {0};
     if (!cbm_http_query_param(req->query, "name", name, (int)sizeof(name)) || name[0] == '\0') {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
@@ -846,13 +1205,17 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
-
-    if (!cbm_file_exists(db_path)) {
+    if (db_path[0] == '\0') {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
     if (unlink(db_path) != 0) {
+        if (errno == ENOENT) {
+            unwatch_project(srv, name);
+            cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+            return;
+        }
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
     }
@@ -864,6 +1227,7 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
     (void)unlink(wal_path);
     (void)unlink(shm_path);
 
+    unwatch_project(srv, name);
     cbm_log_info("ui.project.deleted", "name", name);
     cbm_http_replyf(c, 200, g_cors_json, "{\"deleted\":true}");
 }
@@ -1471,6 +1835,12 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
+    /* GET /api/repo-info → git remote / branch for GitHub deep-links */
+    if (is_get && cbm_http_path_match(req->path, "/api/repo-info*")) {
+        handle_repo_info(c, req);
+        return;
+    }
+
     /* POST /api/index → start background indexing */
     if (is_post && cbm_http_path_match(req->path, "/api/index")) {
         handle_index_start(c, req);
@@ -1483,9 +1853,15 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
+    /* GET /api/ui-config → language and local UI preferences */
+    if (is_get && cbm_http_path_match(req->path, "/api/ui-config")) {
+        handle_ui_config(c, req);
+        return;
+    }
+
     /* DELETE /api/project → delete a project's .db file */
     if (is_delete && cbm_http_path_match(req->path, "/api/project*")) {
-        handle_delete_project(c, req);
+        handle_delete_project(srv, c, req);
         return;
     }
 
@@ -1617,15 +1993,22 @@ void cbm_http_server_run(cbm_http_server_t *srv) {
         if (!conn)
             continue; /* timeout — re-check stop flag */
 
+        uint64_t request_start_ms = cbm_now_ms();
         cbm_http_req_t req;
         int rc = cbm_httpd_read_request(conn, &req);
         if (rc == 0) {
             dispatch_request(srv, conn, &req);
+            cbm_log_http_request("graph_ui", req.method, req.path, cbm_http_conn_status(conn),
+                                 (int64_t)(cbm_now_ms() - request_start_ms), req.body_len,
+                                 cbm_http_conn_response_bytes(conn));
             cbm_http_req_free(&req);
         } else if (rc > 0) {
             /* Parse/transport error with a known HTTP status (400/408/411/413/431).
              * No CORS reflection here — the request was never parsed. */
             cbm_http_replyf(conn, rc, "", "bad request");
+            cbm_log_http_request("graph_ui", "", "", cbm_http_conn_status(conn),
+                                 (int64_t)(cbm_now_ms() - request_start_ms), 0,
+                                 cbm_http_conn_response_bytes(conn));
         }
         cbm_httpd_conn_close(conn);
     }
@@ -1642,5 +2025,11 @@ int cbm_http_server_port(const cbm_http_server_t *srv) {
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
     if (srv && srv->listener_ok) {
         cbm_httpd_set_recv_deadline_ms(srv->listener, ms);
+    }
+}
+
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher) {
+    if (srv) {
+        srv->watcher = watcher;
     }
 }

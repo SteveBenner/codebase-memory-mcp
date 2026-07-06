@@ -135,6 +135,10 @@ void cbm_registry_init(CBMTypeRegistry *reg, CBMArena *arena) {
 }
 
 void cbm_registry_add_func(CBMTypeRegistry *reg, CBMRegisteredFunc func) {
+    if (reg->read_only) {
+        return; /* sealed Tier-2 shared registry: refuse post-finalize mutation (O(n^2)+race guard)
+                 */
+    }
     if (reg->func_count >= reg->func_cap) {
         int new_cap = reg->func_cap == 0 ? 64 : reg->func_cap * 2;
         CBMRegisteredFunc *new_items = (CBMRegisteredFunc *)cbm_arena_alloc(
@@ -151,6 +155,10 @@ void cbm_registry_add_func(CBMTypeRegistry *reg, CBMRegisteredFunc func) {
 }
 
 void cbm_registry_add_type(CBMTypeRegistry *reg, CBMRegisteredType type) {
+    if (reg->read_only) {
+        return; /* sealed Tier-2 shared registry: refuse post-finalize mutation (O(n^2)+race guard)
+                 */
+    }
     if (reg->type_count >= reg->type_cap) {
         int new_cap = reg->type_cap == 0 ? 64 : reg->type_cap * 2;
         CBMRegisteredType *new_items = (CBMRegisteredType *)cbm_arena_alloc(

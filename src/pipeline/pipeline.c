@@ -27,6 +27,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
@@ -91,8 +92,24 @@ struct cbm_pipeline {
     char **excluded_dirs;
     int excluded_count;
 
+    /* Per-file indexing failures (skipped files) surfaced via MCP/CLI/logfile
+     * (Stage 2 / Track B). A skip is the expected handled outcome of a bad or
+     * oversized file — the run still succeeds ("indexed"). Owned by the
+     * pipeline; freed in cbm_pipeline_free. */
+    cbm_file_error_t *file_errors;
+    int file_errors_count;
+    int file_errors_cap;
+
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
+
+    /* Committed graph size at dump time (-1 = dump did not run). #334 gate axis. */
+    int committed_nodes;
+    int committed_edges;
+
+    /* ADR (project_summaries) captured before a full-reindex DB delete, so it
+     * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
+    char *saved_adr;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -154,6 +171,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
     p->mode = mode;
     p->persistence = false;
+    p->committed_nodes = -1;
+    p->committed_edges = -1;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -163,6 +182,27 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
     }
+}
+
+bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
+    if (!p || !name || !name[0]) {
+        return false;
+    }
+
+    char *normalized = cbm_project_name_from_path(name);
+    if (!normalized) {
+        return false;
+    }
+    if (!cbm_validate_project_name(normalized)) {
+        free(normalized);
+        return false;
+    }
+
+    free(p->project_name);
+    p->project_name = normalized;
+    free(p->branch_qn);
+    p->branch_qn = cbm_git_context_branch_qn(p->project_name, &p->git_ctx);
+    return true;
 }
 
 void cbm_pipeline_free(cbm_pipeline_t *p) {
@@ -175,7 +215,19 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
     p->excluded_dirs = NULL;
     p->excluded_count = 0;
+    for (int i = 0; i < p->file_errors_count; i++) {
+        free(p->file_errors[i].path);
+        free(p->file_errors[i].reason);
+        free(p->file_errors[i].phase);
+    }
+    free(p->file_errors);
+    p->file_errors = NULL;
+    p->file_errors_count = 0;
+    p->file_errors_cap = 0;
     free(p->branch_qn);
+    free(p->saved_adr); /* freed here too: error paths can exit before the
+                         * restore in dump_and_persist_hashes runs. Issue #516. */
+    p->saved_adr = NULL;
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -216,6 +268,80 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
     if (count) {
         *count = p ? p->excluded_count : 0;
     }
+}
+
+/* NULL-safe heap strdup (avoids a strdup dependency + guards NULL inputs). */
+static char *fe_strdup(const char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char *d = (char *)malloc(n);
+    if (d) {
+        memcpy(d, s, n);
+    }
+    return d;
+}
+
+void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+                                 const char *phase) {
+    if (!p) {
+        return;
+    }
+    if (p->file_errors_count >= p->file_errors_cap) {
+        int ncap = p->file_errors_cap ? p->file_errors_cap * 2 : 16;
+        cbm_file_error_t *grown =
+            (cbm_file_error_t *)realloc(p->file_errors, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            /* Never abort indexing just to record a skip — drop this record. */
+            return;
+        }
+        p->file_errors = grown;
+        p->file_errors_cap = ncap;
+    }
+    cbm_file_error_t *e = &p->file_errors[p->file_errors_count];
+    e->path = fe_strdup(path);
+    e->reason = fe_strdup(reason);
+    e->phase = fe_strdup(phase);
+    p->file_errors_count++;
+}
+
+void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count) {
+    if (out) {
+        *out = p ? p->file_errors : NULL;
+    }
+    if (count) {
+        *count = p ? p->file_errors_count : 0;
+    }
+}
+
+void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges) {
+    if (nodes) {
+        *nodes = p ? p->committed_nodes : -1;
+    }
+    if (edges) {
+        *edges = p ? p->committed_edges : -1;
+    }
+}
+
+void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) {
+    if (p) {
+        p->committed_nodes = nodes;
+        p->committed_edges = edges;
+    }
+}
+
+/* Effective worker count. The crash supervisor re-runs its worker single-
+ * threaded (CBM_INDEX_SINGLE_THREAD=1) so a per-file marker can pin the EXACT
+ * crasher; a parallel re-run would race the marker. Honour that override
+ * everywhere the worker count drives the parallel/sequential decision, so the
+ * whole extraction phase collapses to the deterministic sequential path. */
+static int effective_worker_count(bool initial) {
+    const char *st = getenv("CBM_INDEX_SINGLE_THREAD");
+    if (st && st[0] == '1') {
+        return 1;
+    }
+    return cbm_default_worker_count(initial);
 }
 
 /* Resolve the DB path for this pipeline. Caller must free(). */
@@ -462,9 +588,34 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
+/* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
+ * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
+ * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
+ * curl targets) are NOT routes the service serves and must not mint Route nodes
+ * (#521). Exposed-endpoint keys (push_endpoint, post_url, callback, webhook)
+ * are intentionally absent here so they still produce infra Route nodes. */
+static bool is_upstream_config_key(const char *key_path) {
+    if (!key_path) {
+        /* No key context (e.g. flat string) — keep prior behaviour and mint. */
+        return false;
+    }
+    static const char *const deny[] = {"jwks",     "registry",     "registries", "healthcheck",
+                                       "upstream", "_service_url", "auth",       NULL};
+    for (int i = 0; deny[i]; i++) {
+        if (strstr(key_path, deny[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* Try to create an infra Route node from one string_ref. */
 static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, const char *fp) {
     if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+        return;
+    }
+    /* Skip upstream/config/healthcheck URLs — they are not exposed routes (#521). */
+    if (is_upstream_config_key(sr->key_path)) {
         return;
     }
     char route_qn[CBM_ROUTE_QN_SIZE];
@@ -479,17 +630,51 @@ static void try_upsert_infra_route(cbm_gbuf_t *gbuf, const CBMStringRef *sr, con
     cbm_gbuf_upsert_node(gbuf, "Route", sr->value, route_qn, fp, 0, 0, route_props);
 }
 
+/* A URL string_ref that does NOT denote a route the service serves: a value
+ * containing whitespace is a command/sentence with an embedded URL (e.g. a
+ * Docker healthcheck `curl --fail http://... || exit 1`); a NULL key_path is a
+ * context-less/duplicate ref; an upstream/config/healthcheck key is an external
+ * dependency, not an exposed route. (#521) */
+static bool route_sr_denied(const CBMStringRef *sr) {
+    if (!sr->value || strchr(sr->value, ' ')) {
+        return true;
+    }
+    if (!sr->key_path) {
+        return true;
+    }
+    return is_upstream_config_key(sr->key_path);
+}
+
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
-    for (int i = 0; i < file_count; i++) {
-        if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
-            continue;
-        }
-        for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
-            try_upsert_infra_route(gbuf, &result_cache[i]->string_refs.items[si],
-                                   files[i].rel_path);
+    /* DENY-WINS-BY-VALUE: the same URL is often extracted as several string_refs
+     * at different key_path granularities (full path, leaf key, flat). The Route
+     * node is keyed by VALUE, so it would be minted if ANY granularity passed the
+     * per-ref guard — e.g. a denied full path `registries.terraform-registry.url`
+     * is defeated by a sibling leaf `url`. So pass 1 collects every URL value
+     * denied under ANY of its refs; pass 2 mints only values never denied. (#521) */
+    CBMHashTable *denied = cbm_ht_create(16);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < file_count; i++) {
+            if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+                continue;
+            }
+            for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
+                const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+                if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
+                    continue;
+                }
+                if (pass == 0) {
+                    if (denied && route_sr_denied(sr)) {
+                        cbm_ht_set(denied, sr->value, (void *)1);
+                    }
+                } else if (!denied || !cbm_ht_has(denied, sr->value)) {
+                    try_upsert_infra_route(gbuf, sr, files[i].rel_path);
+                }
+            }
         }
     }
+    cbm_ht_free(denied);
 }
 
 /* Run decorator_tags, configlink, and route matching passes. */
@@ -565,8 +750,9 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * Use the repo-walking variant so manifests filtered out by the main
      * discoverer (package.json, composer.json) still feed pkgmap and let
      * workspace imports like `@my/pkg` resolve to their target Module. */
-    cbm_pipeline_set_pkgmap(
-        cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count, ctx->project_name));
+    cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count,
+                                                       ctx->project_name, ctx->excluded_dirs,
+                                                       ctx->excluded_count));
 
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
@@ -788,6 +974,22 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_close(check_store);
     }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
+    /* Capture any ADR before deleting the DB so the full-reindex rebuild can
+     * restore it (project_summaries is otherwise lost). Issue #516. */
+    {
+        cbm_store_t *adr_store = cbm_store_open_path(db_path);
+        if (adr_store) {
+            cbm_adr_t existing;
+            if (cbm_store_adr_get(adr_store, p->project_name, &existing) == CBM_STORE_OK) {
+                if (existing.content) {
+                    free(p->saved_adr);
+                    p->saved_adr = strdup(existing.content);
+                }
+                cbm_store_adr_free(&existing);
+            }
+            cbm_store_close(adr_store);
+        }
+    }
     cbm_unlink(db_path);
     char wal[PL_WAL_BUF];
     char shm[PL_WAL_BUF];
@@ -832,6 +1034,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         *last_slash = '\0';
         cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
+    /* Capture committed counts BEFORE the dump. cbm_gbuf_dump_to_sqlite calls
+     * release_gbuf_indexes(), which frees node_by_qn (graph_buffer.c), after
+     * which cbm_gbuf_node_count() returns 0. Reading these post-dump left
+     * committed_nodes at 0, so the #334 plausibility gate never fired. */
+    p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
+    p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
     int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
@@ -841,6 +1049,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         cbm_store_delete_file_hashes(hash_store, p->project_name);
+
+        /* Restore the ADR captured before the dump. Surface a failed restore
+         * rather than silently dropping the ADR (the original #516 symptom). */
+        if (p->saved_adr) {
+            if (cbm_store_adr_store(hash_store, p->project_name, p->saved_adr) != CBM_STORE_OK) {
+                cbm_log_error("pipeline.err", "phase", "adr_restore", "project", p->project_name);
+            }
+        }
         for (int i = 0; i < file_count; i++) {
             struct stat fst;
             if (stat(files[i].path, &fst) == 0) {
@@ -867,10 +1083,18 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
+    free(p->saved_adr);
+    p->saved_adr = NULL;
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {
-        cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        int arc = cbm_artifact_export(db_path, p->repo_path, p->project_name, CBM_ARTIFACT_BEST);
+        if (arc != 0) {
+            const char *err = cbm_artifact_export_last_error();
+            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            /* A failed persistence export intentionally fails the run; this used to be ignored. */
+            return arc;
+        }
     }
 
     return 0;
@@ -887,7 +1111,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (cbm_default_worker_count(true) > SKIP_ONE) {
+        if (effective_worker_count(true) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -976,7 +1200,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = cbm_default_worker_count(true);
+    int worker_count = effective_worker_count(true);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
@@ -1051,7 +1275,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL
      * when no usable configs are found — non-TS projects pay nothing. */
-    path_aliases = cbm_load_path_aliases(p->repo_path);
+    path_aliases =
+        cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
@@ -1060,8 +1285,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .gbuf = p->gbuf,
         .registry = p->registry,
         .cancelled = &p->cancelled,
+        .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
+        .excluded_dirs = p->excluded_dirs,
+        .excluded_count = p->excluded_count,
     };
 
     rc = run_extraction_phase(p, &ctx, files, file_count);

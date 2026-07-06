@@ -356,6 +356,100 @@ static cbm_resolution_t empty_result(void) {
     return r;
 }
 
+/* ── Perl builtin guard (#459 follow-up: call-graph noise) ──────────
+ * Curated subset of perlfunc core builtins. When a Perl CALL resolves
+ * only by the generic short-name matcher (no LSP, no import, after the
+ * same-module/name-lookup chain), a builtin name like `push`/`shift`/
+ * `keys` must NOT be wired to a project sub that merely shares the name
+ * — that is virtually always a false positive. A genuine intra-project
+ * call is resolved by earlier (LSP/textual) stages before this guard.
+ * MUST stay sorted ASCII-ascending for bsearch. */
+static const char *const PERL_BUILTINS[] = {
+    "abs",       "atan2",   "binmode", "bless",     "caller",   "chdir",    "chmod",   "chomp",
+    "chop",      "chown",   "chr",     "chroot",    "close",    "closedir", "cos",     "defined",
+    "delete",    "die",     "do",      "each",      "eof",      "eval",     "exec",    "exists",
+    "exit",      "fork",    "gmtime",  "goto",      "grep",     "hex",      "index",   "int",
+    "join",      "keys",    "last",    "lc",        "lcfirst",  "length",   "local",   "localtime",
+    "log",       "lstat",   "map",     "mkdir",     "my",       "next",     "oct",     "open",
+    "opendir",   "ord",     "our",     "pop",       "pos",      "print",    "printf",  "push",
+    "quotemeta", "rand",    "read",    "readdir",   "readline", "redo",     "ref",     "rename",
+    "require",   "return",  "reverse", "rindex",    "rmdir",    "say",      "scalar",  "seek",
+    "shift",     "sin",     "sleep",   "sort",      "splice",   "split",    "sprintf", "sqrt",
+    "srand",     "stat",    "substr",  "system",    "time",     "uc",       "ucfirst", "undef",
+    "unlink",    "unshift", "values",  "wantarray", "warn",     "write",
+};
+
+static int perl_builtin_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, *(const char *const *)elem);
+}
+
+/* True if `name` is one of the curated Perl core builtins. Used to suppress
+ * generic-resolver CALLS edges from Perl builtin invocations to project subs
+ * that happen to share the builtin's name. Perl-scoped: callers gate on the
+ * file language so no other language's resolution is affected. */
+bool cbm_perl_is_builtin(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return bsearch(name, PERL_BUILTINS, sizeof(PERL_BUILTINS) / sizeof(PERL_BUILTINS[0]),
+                   sizeof(PERL_BUILTINS[0]), perl_builtin_cmp) != NULL;
+}
+
+/* Decide whether a *resolved* Perl call edge is generic-resolver noise that
+ * should be suppressed (#476). Returns true only for Perl, only for a builtin
+ * invocation or a method call, and only when the registry landed the match via
+ * a WEAK short-name strategy. High-confidence import/same-module strategies
+ * (same_module, import_map, import_map_suffix) are KEPT so a genuine same-file
+ * or imported call to a builtin-named sub still resolves — only the weak
+ * short-name guesses (suffix_match, unique_name) are dropped. `strategy` is the
+ * cbm_resolution_t.strategy of a non-empty match;
+ * NULL/empty (no match) returns false. Pure + side-effect-free so the
+ * suppression contract is unit-testable without a full pipeline. */
+bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
+                                     const char *strategy) {
+    if (!is_perl) {
+        return false;
+    }
+    if (!(is_method || cbm_perl_is_builtin(callee_name))) {
+        return false;
+    }
+    if (!strategy || !strategy[0]) {
+        return false;
+    }
+    if (strcmp(strategy, "same_module") == 0 || strcmp(strategy, "import_map") == 0 ||
+        strcmp(strategy, "import_map_suffix") == 0) {
+        return false; /* high-confidence import/same-module match — keep the genuine edge */
+    }
+    return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
+}
+
+/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
+ * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
+ * could not resolve the receiver type — type-resolved calls win via lsp_*
+ * strategies before the registry runs. Binding such a call to a project symbol
+ * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
+ * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
+ * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
+ * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
+ * default-drop) because the parallel resolver runs lsp_* strategies through the
+ * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
+ * + side-effect-free so the contract is unit-testable without a full pipeline. */
+bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
+    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+        return false;
+    }
+    /* Weak short-name strategies that actually reach the call-resolution guards:
+     * the registry's suffix_match / unique_name and the parallel field_type_hint.
+     * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
+     * is not wired into the sequential/parallel resolvers today, so it never
+     * reaches this helper, but naming it keeps a future wiring from silently
+     * reintroducing the noise. Everything else — same_module / import_map /
+     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
+     * lsp_* — is a receiver- or import-aware match and is KEPT. */
+    return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
+           strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -587,6 +681,63 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
     return empty_result();
 }
 
+/* Confidence for a full qualified-tail match (Strategy 3.5). A package- or
+ * namespace-qualified callee that uniquely matches one candidate's full tail is
+ * as trustworthy as a same-module hit. */
+#define CONF_QUALIFIED_SUFFIX 0.90
+
+/* When a callee is package/namespace-qualified (Foo::Bar::sub or Foo.Bar.sub),
+ * disambiguate among same-simple-name candidates by matching the FULL qualified
+ * tail against each candidate QN at a segment boundary. Returns the sole
+ * candidate whose QN equals or ends with ".<dotted-callee>", or NULL when zero
+ * or several candidates match (the caller then falls back to bare-name scoring).
+ *
+ * Fixes qualified cross-file calls collapsing onto one namespace when the bare
+ * symbol name is defined in several — e.g. Perl's Foo::Bar::run and Foo::Baz::run
+ * both reduce to "run", so the bare-name scorer would route every caller to a
+ * single winner. Language agnostic: callees with no separator return NULL and
+ * leave behavior unchanged. */
+static const char *qualified_suffix_match(const qn_array_t *arr, const char *callee_name) {
+    /* Normalize "::" → "." so the tail composes with dotted candidate QNs. */
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else {
+            dotted[w++] = *s++;
+        }
+    }
+    dotted[w] = '\0';
+    /* Must be qualified (contain a '.') — a bare name matches every candidate
+     * and carries no disambiguating signal. */
+    if (!strchr(dotted, '.')) {
+        return NULL;
+    }
+    const char *match = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        const char *qn = arr->items[i];
+        size_t qlen = strlen(qn);
+        if (qlen < w) {
+            continue;
+        }
+        const char *tail = qn + (qlen - w);
+        if (strcmp(tail, dotted) != 0) {
+            continue;
+        }
+        /* Segment boundary: tail is the whole QN or is preceded by '.'. */
+        if (tail != qn && tail[-1] != '.') {
+            continue;
+        }
+        if (match) {
+            return NULL; /* ambiguous — more than one qualified tail matches */
+        }
+        match = qn;
+    }
+    return match;
+}
+
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
@@ -598,6 +749,16 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
     if (arr->count > REG_MAX_CANDIDATES) {
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
+    }
+
+    /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
+     * candidates by full qualified tail, before bare-name scoring collapses
+     * them onto a single winner. */
+    if (arr->count > 1) {
+        const char *q = qualified_suffix_match(arr, callee_name);
+        if (q) {
+            return (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
+        }
     }
 
     /* Strategy 3: unique name */

@@ -81,6 +81,9 @@ ALLOWED_URLS=(
     "https://bugs.launchpad.net"
     "https://gcc.gnu.org"
     "https://sourceware.org"
+    # MSYS2 CLANG64 toolchain (libc++/compiler-rt) package-tracker URL, baked
+    # into the static Windows .exe — Windows-only, hence Linux smoke stays clean.
+    "https://github.com/msys2/MINGW-packages"
     # W3C XML namespace URIs (SVG, MathML, XLink — used in UI bundle)
     "http://www.w3.org/"
     # UI bundle: React, Three.js, Tailwind, Google Fonts, bundled libraries

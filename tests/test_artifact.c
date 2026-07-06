@@ -4,8 +4,10 @@
 #include "test_framework.h"
 #include "store/store.h"
 #include "pipeline/artifact.h"
+#include "pipeline/pipeline.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/log.h"
 
 #include <sys/stat.h>
 #include <stdio.h>
@@ -15,6 +17,9 @@
 static char g_tmpdir[1024];
 static char g_repo[1024];
 static char g_db[1024];
+enum { ART_TEST_LOG_BUF = 32768 };
+static char g_log_capture[ART_TEST_LOG_BUF];
+static CBMLogLevel g_prev_log_level;
 
 static void setup_artifact_test(void) {
     snprintf(g_tmpdir, sizeof(g_tmpdir), "%s/cbm_test_artifact_XXXXXX", cbm_tmpdir());
@@ -51,6 +56,40 @@ static void cleanup_dir(const char *path) {
     char cmd[2048];
     snprintf(cmd, sizeof(cmd), "rm -rf '%s'", path);
     (void)system(cmd);
+}
+
+static void write_text_file(const char *path, const char *text) {
+    FILE *fp = fopen(path, "w");
+    if (!fp) {
+        return;
+    }
+    fputs(text, fp);
+    fclose(fp);
+}
+
+static void capture_log_sink(const char *line) {
+    size_t used = strlen(g_log_capture);
+    size_t avail = sizeof(g_log_capture) - used;
+    if (avail <= 1) {
+        return;
+    }
+    int n = snprintf(g_log_capture + used, avail, "%s\n", line);
+    if (n < 0 || (size_t)n >= avail) {
+        g_log_capture[sizeof(g_log_capture) - 1] = '\0';
+    }
+}
+
+static void capture_logs_start(void) {
+    g_log_capture[0] = '\0';
+    g_prev_log_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(capture_log_sink);
+}
+
+static const char *capture_logs_end(void) {
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(g_prev_log_level);
+    return g_log_capture;
 }
 
 /* ── Tests ───────────────────────────────────────────────────────── */
@@ -207,6 +246,68 @@ TEST(artifact_gitattributes_created) {
     PASS();
 }
 
+TEST(artifact_export_rename_failure_logs_specific_error) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char art_dir[1024];
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", g_repo);
+    cbm_mkdir_p(art_dir, 0755);
+
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/graph.db.zst", art_dir);
+    cbm_mkdir_p(zst, 0755);
+
+    capture_logs_start();
+    int rc = cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST);
+    const char *logs = capture_logs_end();
+
+    ASSERT_NEQ(rc, 0);
+    ASSERT_FALSE(cbm_artifact_exists(g_repo));
+    ASSERT_NOT_NULL(cbm_artifact_export_last_error());
+    ASSERT(strstr(cbm_artifact_export_last_error(), "write_artifact") != NULL);
+    ASSERT(strstr(cbm_artifact_export_last_error(), "rename_temp") != NULL);
+    ASSERT(strstr(logs, "msg=artifact.export") != NULL);
+    ASSERT(strstr(logs, "stage=write_artifact") != NULL);
+    ASSERT(strstr(logs, "err=rename_temp") != NULL);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(pipeline_persistence_export_failure_returns_error) {
+    setup_artifact_test();
+
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/main.c", g_repo);
+    write_text_file(src, "int main(void) { return 0; }\n");
+
+    char art_dir[1024];
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", g_repo);
+    cbm_mkdir_p(art_dir, 0755);
+
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/graph.db.zst", art_dir);
+    cbm_mkdir_p(zst, 0755);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+
+    capture_logs_start();
+    int rc = cbm_pipeline_run(p);
+    const char *logs = capture_logs_end();
+    cbm_pipeline_free(p);
+
+    ASSERT_NEQ(rc, 0);
+    ASSERT_FALSE(cbm_artifact_exists(g_repo));
+    ASSERT(strstr(logs, "msg=pipeline.err") != NULL);
+    ASSERT(strstr(logs, "phase=artifact_export") != NULL);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_null_safety) {
     ASSERT_NEQ(cbm_artifact_export(NULL, "/tmp", "p", 0), 0);
     ASSERT_NEQ(cbm_artifact_export("/tmp/x.db", NULL, "p", 0), 0);
@@ -217,7 +318,53 @@ TEST(artifact_null_safety) {
     PASS();
 }
 
+/* ── git shell-out path safety ────────────────────────────────────────────────
+ *
+ * artifact.c shells out to git via cbm_popen with the repo path interpolated into
+ * the command. It previously used single quotes (`git -C '%s'`) with NO validation
+ * — but cmd.exe does not honor single quotes, so on Windows a repo path with a space
+ * broke argument grouping, and an embedded quote/metacharacter could break out of the
+ * intended argument entirely. The hardening validates the path and switches to double
+ * quotes; cbm_artifact_repo_path_is_shell_safe() is the guard. Rejecting quotes and
+ * shell/cmd.exe metacharacters is the contract; spaces must stay allowed (double
+ * quotes handle them) — that is the concrete regression the single-quote form caused. */
+TEST(artifact_repo_path_shell_safe_accepts_plain_and_spaced) {
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/home/user/repo"));
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("C:/Users/me/repo"));
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/home/user/my repo")); /* space OK */
+    PASS();
+}
+
+TEST(artifact_repo_path_shell_safe_rejects_injection) {
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe(NULL));
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("it's"));        /* single quote */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("a\"b"));        /* double quote */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("x; rm -rf /")); /* command sep */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("$(whoami)"));   /* substitution */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("a`id`b"));      /* backtick */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("a|b"));         /* pipe */
+    PASS();
+}
+
+TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows) {
+#ifdef _WIN32
+    /* cmd.exe expands %VAR%, delayed !VAR!, and escapes with ^ even inside double
+     * quotes — git_context.c rejects these on Windows and this must match. */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("C:/a%USERPROFILE%b"));
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("C:/a!b"));
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("C:/a^b"));
+#else
+    /* POSIX shells treat % ! ^ literally inside double quotes — allowed. */
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/a%b"));
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/a^b"));
+#endif
+    PASS();
+}
+
 SUITE(artifact) {
+    RUN_TEST(artifact_repo_path_shell_safe_accepts_plain_and_spaced);
+    RUN_TEST(artifact_repo_path_shell_safe_rejects_injection);
+    RUN_TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
@@ -225,5 +372,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_schema_version_mismatch);
     RUN_TEST(artifact_import_missing);
     RUN_TEST(artifact_gitattributes_created);
+    RUN_TEST(artifact_export_rename_failure_logs_specific_error);
+    RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_null_safety);
 }

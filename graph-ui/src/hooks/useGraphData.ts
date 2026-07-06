@@ -17,7 +17,7 @@ interface UseGraphDataResult {
 /* JSON fallback for small graphs / older clients. The binary endpoint is the
  * primary path now — it drops payload size by ~5-10x and parses straight into
  * typed arrays the renderer can hand to the GPU without per-node JS overhead. */
-async function fetchLayoutJson(
+export async function fetchLayoutJson(
   project: string,
   opts: { lod?: "overview" | "full"; maxNodes?: number } = {},
 ): Promise<GraphData> {

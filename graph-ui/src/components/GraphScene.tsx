@@ -18,7 +18,13 @@ interface CameraTarget {
   lookAt: THREE.Vector3;
 }
 
-function CameraAnimator({ target }: { target: CameraTarget | null }) {
+function CameraAnimator({
+  target,
+  controlsRef,
+}: {
+  target: CameraTarget | null;
+  controlsRef: React.RefObject<OrbitControlsImpl | null>;
+}) {
   const { camera } = useThree();
   const targetRef = useRef<CameraTarget | null>(null);
   const progress = useRef(1);
@@ -37,7 +43,17 @@ function CameraAnimator({ target }: { target: CameraTarget | null }) {
     const t = 1 - Math.pow(1 - progress.current, 3); /* ease-out cubic */
 
     camera.position.lerp(targetRef.current.position, t * 0.08);
-    camera.lookAt(targetRef.current.lookAt);
+
+    /* Move the OrbitControls pivot to the focus point as well. Otherwise the
+     * controls keep their target at the origin and re-center the view on the
+     * next frame, snapping the camera back to the middle after the fly-to. */
+    const controls = controlsRef.current;
+    if (controls) {
+      controls.target.lerp(targetRef.current.lookAt, t * 0.08);
+      controls.update();
+    } else {
+      camera.lookAt(targetRef.current.lookAt);
+    }
   });
 
   return null;
@@ -46,6 +62,8 @@ function CameraAnimator({ target }: { target: CameraTarget | null }) {
 /* ── Idle auto-rotation ──────────────────────────────────── */
 
 const IDLE_TIMEOUT_MS = 60_000;
+export const GRAPH_CANVAS_DPR: [number, number] = [1, 1.5];
+export const GRAPH_COMPOSER_MULTISAMPLING = 0;
 
 function IdleAutoRotate({
   controlsRef,
@@ -122,8 +140,12 @@ export function GraphScene({
     <Canvas
       camera={{ position: [0, 0, 800], fov: 50, near: 0.1, far: 100000 }}
       style={{ background: "#06090f" }}
-      dpr={[1, 2]}
-      gl={{ antialias: true, alpha: false }}
+      dpr={GRAPH_CANVAS_DPR}
+      gl={{
+        antialias: false,
+        alpha: false,
+        powerPreference: "high-performance",
+      }}
     >
       <color attach="background" args={["#06090f"]} />
       <ambientLight intensity={0.5} />
@@ -185,11 +207,11 @@ export function GraphScene({
 
       {hovered && <NodeTooltip node={hovered} />}
 
-      <CameraAnimator target={cameraTarget} />
+      <CameraAnimator target={cameraTarget} controlsRef={controlsRef} />
       <IdleAutoRotate controlsRef={controlsRef} />
 
       {primaryNodeCount <= BLOOM_MAX_NODES && (
-        <EffectComposer>
+        <EffectComposer multisampling={GRAPH_COMPOSER_MULTISAMPLING}>
           <Bloom
             luminanceThreshold={0.3}
             luminanceSmoothing={0.7}

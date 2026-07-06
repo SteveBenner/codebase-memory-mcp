@@ -32,7 +32,22 @@
 extern const TSLanguage *tree_sitter_php_only(void);
 
 /* Forward decls */
-static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node);
+static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    php_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void process_function_like(PHPLSPContext *ctx, TSNode node);
 static void process_class_decl(PHPLSPContext *ctx, TSNode node);
 static const CBMType *php_substitute_template(CBMArena *arena, const CBMType *t,
@@ -1235,8 +1250,8 @@ static const CBMType *eval_member_call_type(PHPLSPContext *ctx, TSNode call_node
 
 /* ── emit ───────────────────────────────────────────────────────── */
 
-static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
-                          float confidence) {
+static void emit_resolved_reason(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
+                                 float confidence, const char *reason) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
     CBMResolvedCall rc;
@@ -1244,8 +1259,13 @@ static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char 
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
-    rc.reason = NULL;
+    rc.reason = reason;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void emit_resolved(PHPLSPContext *ctx, const char *callee_qn, const char *strategy,
+                          float confidence) {
+    emit_resolved_reason(ctx, callee_qn, strategy, confidence, NULL);
 }
 
 static void emit_unresolved(PHPLSPContext *ctx, const char *expr_text, const char *reason) {
@@ -1524,10 +1544,14 @@ static void resolve_member_call(PHPLSPContext *ctx, TSNode call) {
         emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
         return;
     }
-    /* Receiver known but method missing — magic __call? */
+    /* Receiver known but method missing — magic __call? The call dispatches to
+     * the class's __call handler, so resolve to <class>.__call (a real node).
+     * The textual callee is the dynamic method name (`anything`), not `__call`,
+     * so stash it in reason for the join (lsp_resolve.h, php_method_dynamic).
+     * Emit above the join's confidence floor — dispatch to __call is certain. */
     if (class_has_magic_call(ctx, class_qn, false)) {
-        emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, method_name),
-                      "php_method_dynamic", 0.20f);
+        emit_resolved_reason(ctx, cbm_arena_sprintf(ctx->arena, "%s.__call", class_qn),
+                             "php_method_dynamic", 0.85f, method_name);
         return;
     }
     /* Receiver known but class not in registry (e.g. vendor type not indexed,
@@ -2101,7 +2125,7 @@ static void process_if_statement(PHPLSPContext *ctx, TSNode node) {
 }
 
 /* Walk a subtree, binding scope and resolving calls. */
-static void php_resolve_calls_in_node(PHPLSPContext *ctx, TSNode node) {
+static void php_resolve_calls_in_node_inner(PHPLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node))
         return;
     const char *kind = ts_node_type(node);
