@@ -24,10 +24,15 @@
 
 /* ── Constants ────────────────────────────────────────────────── */
 
-/* No hard cap — pass max_nodes <= 0 to fetch every node in the project.
- * The renderer (graph-ui) handles 1M+ via instanced/typed-array streaming.
- * CBM_UI_MAX_RENDER_NODES opts back into a cap (see render_node_limit). */
-#define DEFAULT_MAX_NODES 0 /* 0 → unbounded; store query treats <=0 as no limit */
+/* Detail requests are capped at 200k nodes by default. The renderer
+ * (graph-ui) handles 1M+ via instanced/typed-array streaming, but an
+ * unbounded compute runs inside the long-lived server process — on a
+ * kernel-sized graph that is gigabytes of transient heap and minutes-to-
+ * hours of CPU per request, enough to take down a constrained host.
+ * CBM_UI_MAX_RENDER_NODES overrides: a positive value sets the cap,
+ * "0" removes it entirely (explicit opt-in to unbounded payloads).
+ * See render_node_limit. */
+#define DEFAULT_RENDER_NODE_CAP 200000
 #define BH_THETA 1.2f
 #define OCTREE_MAX_DEPTH 26   /* stop subdividing coincident points (OOM guard) */
 #define OCTREE_MIN_HALF 1e-4f /* minimum octree cell half-size */
@@ -178,20 +183,25 @@ static float rand_float(uint32_t *seed) {
     return (float)((*seed >> 16) & 0x7FFF) / 32768.0f - 0.5f;
 }
 
-/* Optional render cap. Unset/invalid CBM_UI_MAX_RENDER_NODES means no cap
- * (return 0) — the fork default. A positive value is an explicit opt-in
- * ceiling for constrained hosts; there is no hard upper bound because the
- * frontend renders 1M+ nodes via instanced typed-array streaming. */
+/* Render cap. Unset CBM_UI_MAX_RENDER_NODES → DEFAULT_RENDER_NODE_CAP.
+ * "0" → no cap (explicit opt-in to full million-node payloads). Any other
+ * positive value → that ceiling. Garbage/negative values fall back to the
+ * safe default rather than to unbounded. There is no hard upper bound
+ * because the frontend renders 1M+ nodes via instanced typed-array
+ * streaming — the cap exists to protect the server process, not the GPU. */
 static int render_node_limit(void) {
     const char *raw = getenv("CBM_UI_MAX_RENDER_NODES");
     if (!raw || !raw[0]) {
-        return DEFAULT_MAX_NODES;
+        return DEFAULT_RENDER_NODE_CAP;
     }
     errno = 0;
     char *end = NULL;
     long v = strtol(raw, &end, 10);
-    if (errno != 0 || end == raw || *end != '\0' || v <= 0) {
-        return DEFAULT_MAX_NODES;
+    if (errno != 0 || end == raw || *end != '\0' || v < 0) {
+        return DEFAULT_RENDER_NODE_CAP;
+    }
+    if (v == 0) {
+        return 0; /* explicit opt-in: unbounded */
     }
     if (v > 0x7fffffff) {
         return 0x7fffffff;
@@ -403,14 +413,40 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
 
 /* ── Call depth via BFS ───────────────────────────────────────── */
 
-static void compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
-                               int *depth) {
+void cbm_layout_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
+                           int *depth) {
     for (int i = 0; i < n; i++)
         depth[i] = -1;
     int *q = malloc((size_t)n * sizeof(int));
     int head = 0, tail = 0;
     if (!q)
         return;
+
+    /* CSR out-adjacency, built in O(n + e): off[i]..off[i+1] indexes adj[]
+     * with i's neighbors. The BFS then touches each edge exactly once.
+     * The previous implementation rescanned the entire edge array per
+     * dequeued node — O(n·e), which uncapped meant hours of CPU per layout
+     * request at 1M nodes / 10M edges. Out-of-range endpoints are dropped
+     * here (the old loop skipped them per-visit). If the CSR allocations
+     * fail we keep the old per-node scan as a slow fallback. */
+    int *off = calloc((size_t)n + 1, sizeof(int));
+    int *adj = ne > 0 ? malloc((size_t)ne * sizeof(int)) : NULL;
+    int *cursor = malloc((size_t)n * sizeof(int));
+    bool csr_ok = off && cursor && (ne == 0 || adj);
+    if (csr_ok) {
+        for (int e = 0; e < ne; e++) {
+            if (es[e] >= 0 && es[e] < n && ed[e] >= 0 && ed[e] < n)
+                off[es[e] + 1]++;
+        }
+        for (int i = 0; i < n; i++)
+            off[i + 1] += off[i];
+        memcpy(cursor, off, (size_t)n * sizeof(int));
+        for (int e = 0; e < ne; e++) {
+            if (es[e] >= 0 && es[e] < n && ed[e] >= 0 && ed[e] < n)
+                adj[cursor[es[e]]++] = ed[e];
+        }
+    }
+    free(cursor);
 
     /* Entry points at depth 0 */
     for (int i = 0; i < n; i++) {
@@ -438,18 +474,30 @@ static void compute_call_depth(int n, const int *es, const int *ed, int ne, cons
     }
     while (head < tail) {
         int c = q[head++], cd = depth[c];
-        for (int e = 0; e < ne; e++)
-            if (es[e] == c) {
-                int t = ed[e];
-                if (t >= 0 && t < n && depth[t] == -1) {
+        if (csr_ok) {
+            for (int k = off[c]; k < off[c + 1]; k++) {
+                int t = adj[k];
+                if (depth[t] == -1) {
                     depth[t] = cd + SKIP_ONE;
                     q[tail++] = t;
                 }
             }
+        } else {
+            for (int e = 0; e < ne; e++)
+                if (es[e] == c) {
+                    int t = ed[e];
+                    if (t >= 0 && t < n && depth[t] == -1) {
+                        depth[t] = cd + SKIP_ONE;
+                        q[tail++] = t;
+                    }
+                }
+        }
     }
     for (int i = 0; i < n; i++)
         if (depth[i] == -1)
             depth[i] = 0;
+    free(off);
+    free(adj);
     free(q);
 }
 
@@ -635,7 +683,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         for (int i = 0; i < n; i++)
             lbls[i] = search_out.results[i].node.label;
         if (cdepth)
-            compute_call_depth(n, es, ed, mapped, lbls, cdepth);
+            cbm_layout_call_depth(n, es, ed, mapped, lbls, cdepth);
         free(lbls);
     }
 

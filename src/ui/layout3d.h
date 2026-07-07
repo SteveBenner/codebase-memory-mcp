@@ -62,7 +62,11 @@ typedef enum {
 /* Compute layout for a project.
  * center_node: QN of center (for detail level), NULL for overview
  * radius: hop distance from center (for detail level)
- * max_nodes: cap on returned nodes; <=0 means "no cap" (return every node).
+ * max_nodes: cap on returned nodes; <=0 means "no explicit cap", which is
+ *   then subject to the render cap: 200k nodes by default, overridable via
+ *   CBM_UI_MAX_RENDER_NODES (positive = ceiling, "0" = truly unbounded).
+ *   total_nodes in the result always carries the uncapped project count so
+ *   callers can tell a truncated payload from a complete one.
  *   OVERVIEW additionally filters to min_degree >= 2 so huge graphs return a
  *   small hub-only preview while the full DETAIL payload is being built.
  *   If that filter matches nothing on a non-empty project (tiny graphs where
@@ -71,6 +75,14 @@ typedef enum {
 cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                                         cbm_layout_level_t level, const char *center_node,
                                         int radius, int max_nodes);
+
+/* BFS call-depth used for the z-axis layering (exposed for tests).
+ * es/ed are edge source/target node indices in [0,n); ne is the edge count;
+ * labels[i] picks the depth-0 seeds (Route/File/Module/Package, falling back
+ * to zero-in-degree nodes, then to 0 for anything unreached). Runs in
+ * O(n + e) via a CSR adjacency built internally. depth must hold n ints. */
+void cbm_layout_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
+                           int *depth);
 
 /* Free a layout result. */
 void cbm_layout_free(cbm_layout_result_t *result);

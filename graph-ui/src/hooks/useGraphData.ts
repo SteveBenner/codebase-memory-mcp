@@ -1,6 +1,6 @@
 import { useCallback, useRef, useState } from "react";
 import type { GraphData } from "../lib/types";
-import { fetchLayoutBinary } from "../lib/layoutBinary";
+import { fetchLayoutBinary, LayoutHttpError } from "../lib/layoutBinary";
 
 interface UseGraphDataResult {
   data: GraphData | null;
@@ -29,10 +29,48 @@ export async function fetchLayoutJson(
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(body.error ?? `HTTP ${res.status}`);
+    const raw = res.headers?.get?.("retry-after");
+    const secs = raw ? Number.parseInt(raw, 10) : NaN;
+    throw new LayoutHttpError(
+      body.error ?? `HTTP ${res.status}`,
+      res.status,
+      Number.isFinite(secs) && secs > 0 ? secs : null,
+    );
   }
 
   return res.json();
+}
+
+const INDEXING_RETRY_MAX = 30; /* ~5 min at the server's 10s hint */
+const INDEXING_RETRY_DEFAULT_SECS = 10;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/* Binary-first fetch with two failure policies:
+ *  - 503 (project is being indexed): wait for the server's Retry-After hint
+ *    and retry, as long as the caller still wants this project. The JSON
+ *    endpoint would 503 identically, so no fallback.
+ *  - anything else: fall back to the JSON endpoint once. */
+export async function fetchLayoutResilient(
+  project: string,
+  opts: { lod?: "overview" | "full"; maxNodes?: number },
+  stillWanted: () => boolean,
+): Promise<GraphData> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fetchLayoutBinary(project, opts);
+    } catch (e) {
+      if (e instanceof LayoutHttpError && e.status === 503) {
+        if (attempt >= INDEXING_RETRY_MAX || !stillWanted()) throw e;
+        await sleep((e.retryAfterSecs ?? INDEXING_RETRY_DEFAULT_SECS) * 1000);
+        if (!stillWanted()) throw e;
+        continue;
+      }
+      return fetchLayoutJson(project, opts);
+    }
+  }
 }
 
 export function useGraphData(): UseGraphDataResult {
@@ -53,9 +91,11 @@ export function useGraphData(): UseGraphDataResult {
     /* Phase 1: hub-only overview via binary — usually <2k nodes, renders
      * effectively instantly so the user sees structure right away. */
     try {
-      const overview = await fetchLayoutBinary(project, {
-        lod: "overview",
-      }).catch(() => fetchLayoutJson(project, { lod: "overview" }));
+      const overview = await fetchLayoutResilient(
+        project,
+        { lod: "overview" },
+        () => activeProject.current === project,
+      );
       if (activeProject.current !== project) return;
       setData(overview);
     } catch (e) {
@@ -72,8 +112,10 @@ export function useGraphData(): UseGraphDataResult {
      * lands; the overview keeps the canvas alive in the meantime. */
     setStreaming(true);
     try {
-      const full = await fetchLayoutBinary(project).catch(() =>
-        fetchLayoutJson(project),
+      const full = await fetchLayoutResilient(
+        project,
+        {},
+        () => activeProject.current === project,
       );
       if (activeProject.current !== project) return;
       setData(full);
@@ -93,8 +135,10 @@ export function useGraphData(): UseGraphDataResult {
       setError(null);
       try {
         /* TODO: detail level with center_node filtering — server-side */
-        const result = await fetchLayoutBinary(project).catch(() =>
-          fetchLayoutJson(project),
+        const result = await fetchLayoutResilient(
+          project,
+          {},
+          () => activeProject.current === project,
         );
         if (activeProject.current === project) setData(result);
       } catch (e) {

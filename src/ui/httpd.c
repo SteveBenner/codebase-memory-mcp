@@ -513,6 +513,8 @@ static const char *status_reason(int status) {
         return "Request Header Fields Too Large";
     case 500:
         return "Internal Server Error";
+    case 503:
+        return "Service Unavailable";
     default:
         return "";
     }

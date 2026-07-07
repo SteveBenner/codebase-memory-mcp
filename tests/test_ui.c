@@ -374,6 +374,171 @@ TEST(layout_clamps_render_cap_from_env) {
     PASS();
 }
 
+TEST(layout_env_zero_uncaps) {
+    /* CBM_UI_MAX_RENDER_NODES="0" is the explicit opt-in to unbounded:
+     * every node comes back even when the caller passes max_nodes=0. */
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    const char *old_raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    char *old_cap = old_raw ? strdup(old_raw) : NULL;
+    cbm_setenv("CBM_UI_MAX_RENDER_NODES", "0", 1);
+
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+    for (int i = 0; i < 30; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test::fn%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "a.c",
+                        .start_line = i,
+                        .end_line = i + 1};
+        cbm_store_upsert_node(store, &n);
+    }
+
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_DETAIL, NULL, 0, 0);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, 30);
+    ASSERT_EQ(r->total_nodes, 30);
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    if (old_cap) {
+        cbm_setenv("CBM_UI_MAX_RENDER_NODES", old_cap, 1);
+        free(old_cap);
+    } else {
+        cbm_unsetenv("CBM_UI_MAX_RENDER_NODES");
+    }
+    PASS();
+}
+
+TEST(layout_garbage_env_falls_back_to_default_cap) {
+    /* An unparsable override must fall back to the safe default cap, not
+     * to unbounded. Indistinguishable from uncapped at 30 nodes, so assert
+     * via a small explicit request still working (clamp passthrough) and
+     * the compute not rejecting the value. */
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    const char *old_raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    char *old_cap = old_raw ? strdup(old_raw) : NULL;
+    cbm_setenv("CBM_UI_MAX_RENDER_NODES", "not-a-number", 1);
+
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+    for (int i = 0; i < 30; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test::fn%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "a.c",
+                        .start_line = i,
+                        .end_line = i + 1};
+        cbm_store_upsert_node(store, &n);
+    }
+
+    /* Explicit small cap still wins over the (large) default. */
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_DETAIL, NULL, 0, 7);
+    ASSERT_NOT_NULL(r);
+    ASSERT_LTE(r->node_count, 7);
+    ASSERT_EQ(r->total_nodes, 30);
+    cbm_layout_free(r);
+
+    /* And max_nodes=0 under the default 200k cap returns all 30. */
+    r = cbm_layout_compute(store, "test", CBM_LAYOUT_DETAIL, NULL, 0, 0);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, 30);
+    cbm_layout_free(r);
+
+    cbm_store_close(store);
+    if (old_cap) {
+        cbm_setenv("CBM_UI_MAX_RENDER_NODES", old_cap, 1);
+        free(old_cap);
+    } else {
+        cbm_unsetenv("CBM_UI_MAX_RENDER_NODES");
+    }
+    PASS();
+}
+
+TEST(layout_call_depth_chain) {
+    /* File seeds depth 0; a→b→c chain layers below it. */
+    const char *labels[4] = {"File", "Function", "Function", "Function"};
+    /* Edges: 0→1, 1→2, 2→3 */
+    int es[3] = {0, 1, 2};
+    int ed[3] = {1, 2, 3};
+    int depth[4] = {-9, -9, -9, -9};
+    cbm_layout_call_depth(4, es, ed, 3, labels, depth);
+    ASSERT_EQ(depth[0], 0);
+    ASSERT_EQ(depth[1], 1);
+    ASSERT_EQ(depth[2], 2);
+    ASSERT_EQ(depth[3], 3);
+    PASS();
+}
+
+TEST(layout_call_depth_diamond_and_unreached) {
+    /* Diamond 0→{1,2}→3 takes the shortest path; node 4 is unreached and
+     * defaults to depth 0; an out-of-range edge endpoint is ignored. */
+    const char *labels[5] = {"Module", "Function", "Function", "Function", "Function"};
+    int es[5] = {0, 0, 1, 2, 3};
+    int ed[5] = {1, 2, 3, 3, 99 /* out of range — dropped */};
+    int depth[5];
+    cbm_layout_call_depth(5, es, ed, 5, labels, depth);
+    ASSERT_EQ(depth[0], 0);
+    ASSERT_EQ(depth[1], 1);
+    ASSERT_EQ(depth[2], 1);
+    ASSERT_EQ(depth[3], 2);
+    ASSERT_EQ(depth[4], 0);
+    PASS();
+}
+
+TEST(layout_call_depth_no_entry_labels) {
+    /* No Route/File/Module/Package labels → zero-in-degree nodes seed the
+     * BFS. 0→1→2 with all Function labels: node 0 has in-degree 0. */
+    const char *labels[3] = {"Function", "Function", "Function"};
+    int es[2] = {0, 1};
+    int ed[2] = {1, 2};
+    int depth[3];
+    cbm_layout_call_depth(3, es, ed, 2, labels, depth);
+    ASSERT_EQ(depth[0], 0);
+    ASSERT_EQ(depth[1], 1);
+    ASSERT_EQ(depth[2], 2);
+    PASS();
+}
+
+TEST(layout_call_depth_large_chain_fast) {
+    /* 100k-node chain: O(n·e) BFS would do ~1e10 edge scans here (minutes);
+     * the CSR path finishes in milliseconds. The suite-level timeout is the
+     * regression tripwire. */
+    enum { N = 100000 };
+    const char **labels = calloc(N, sizeof(char *));
+    int *es = malloc((N - 1) * sizeof(int));
+    int *ed = malloc((N - 1) * sizeof(int));
+    int *depth = malloc(N * sizeof(int));
+    ASSERT_NOT_NULL(labels);
+    ASSERT_NOT_NULL(es);
+    ASSERT_NOT_NULL(ed);
+    ASSERT_NOT_NULL(depth);
+    labels[0] = "File";
+    for (int i = 0; i < N - 1; i++) {
+        labels[i + 1] = "Function";
+        es[i] = i;
+        ed[i] = i + 1;
+    }
+    cbm_layout_call_depth(N, es, ed, N - 1, labels, depth);
+    ASSERT_EQ(depth[0], 0);
+    ASSERT_EQ(depth[N - 1], N - 1);
+    free((void *)labels);
+    free(es);
+    free(ed);
+    free(depth);
+    PASS();
+}
+
 TEST(layout_deterministic) {
     cbm_store_t *store = cbm_store_open_memory();
     ASSERT_NOT_NULL(store);
@@ -1214,6 +1379,12 @@ SUITE(ui) {
     RUN_TEST(layout_two_connected);
     RUN_TEST(layout_respects_max_nodes);
     RUN_TEST(layout_clamps_render_cap_from_env);
+    RUN_TEST(layout_env_zero_uncaps);
+    RUN_TEST(layout_garbage_env_falls_back_to_default_cap);
+    RUN_TEST(layout_call_depth_chain);
+    RUN_TEST(layout_call_depth_diamond_and_unreached);
+    RUN_TEST(layout_call_depth_no_entry_labels);
+    RUN_TEST(layout_call_depth_large_chain_fast);
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
     RUN_TEST(layout_to_binary_roundtrip);

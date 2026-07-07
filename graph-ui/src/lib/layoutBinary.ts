@@ -329,8 +329,36 @@ export function viewToGraphData(view: GraphView): GraphDataWithView {
   return out;
 }
 
-/* Fetch + parse helper used by useGraphData. Throws on HTTP/parse failure
- * so the caller can fall back to JSON. */
+/* HTTP failure with enough context for the caller to distinguish "retry
+ * later" (503 while the project is being indexed, with the server's
+ * Retry-After hint) from "fall back to the JSON endpoint". */
+export class LayoutHttpError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly retryAfterSecs: number | null,
+  ) {
+    super(message);
+    this.name = "LayoutHttpError";
+  }
+}
+
+function toLayoutHttpError(
+  res: { status: number; statusText: string; headers: { get(n: string): string | null } },
+  message: string,
+): LayoutHttpError {
+  const raw = res.headers.get("retry-after");
+  const secs = raw ? Number.parseInt(raw, 10) : NaN;
+  return new LayoutHttpError(
+    message,
+    res.status,
+    Number.isFinite(secs) && secs > 0 ? secs : null,
+  );
+}
+
+/* Fetch + parse helper used by useGraphData. Throws LayoutHttpError on HTTP
+ * failure (so the caller can retry 503s or fall back to JSON) and a plain
+ * Error on parse failure. */
 export async function fetchLayoutBinary(
   project: string,
   opts: { lod?: "overview" | "full"; maxNodes?: number } = {},
@@ -346,9 +374,9 @@ export async function fetchLayoutBinary(
     const ct = res.headers.get("content-type") ?? "";
     if (ct.includes("application/json")) {
       const body = await res.json().catch(() => ({ error: res.statusText }));
-      throw new Error(body.error ?? `HTTP ${res.status}`);
+      throw toLayoutHttpError(res, body.error ?? `HTTP ${res.status}`);
     }
-    throw new Error(`HTTP ${res.status}`);
+    throw toLayoutHttpError(res, `HTTP ${res.status}`);
   }
   const buf = await res.arrayBuffer();
   const view = parseLayoutBinary(buf);

@@ -26,8 +26,11 @@
 #if defined(HAVE_LIBGIT2)
 #include <git2.h> /* git_repository_open, git_remote_lookup, git_remote_url */
 #endif
-/* pipeline.h no longer needed — indexing runs as subprocess */
+#include "pipeline/pipeline.h" /* cbm_project_name_from_path — match layout requests
+                                * against running index jobs (indexing itself runs as
+                                * a subprocess) */
 #include "foundation/log.h"
+#include "foundation/mem.h" /* cbm_mem_budget — scale the layout blob cache */
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -46,6 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
@@ -145,6 +149,23 @@ typedef struct {
 } index_job_t;
 
 static index_job_t g_index_jobs[MAX_INDEX_JOBS];
+
+/* True if a UI-spawned index job for `project` is currently running.
+ * job->project_name is always filled at spawn time (derived from root_path
+ * when the request omitted it), so a name compare suffices. Only covers
+ * jobs spawned by THIS server — MCP/CLI-driven indexing is a separate
+ * process we can't see; the layout cache's stale-serve window (below)
+ * catches that case via db/WAL mtime churn. */
+static bool layout_project_indexing(const char *project) {
+    if (!project || !project[0])
+        return false;
+    for (int i = 0; i < MAX_INDEX_JOBS; i++) {
+        if (atomic_load(&g_index_jobs[i].status) == 1 &&
+            strcmp(g_index_jobs[i].project_name, project) == 0)
+            return true;
+    }
+    return false;
+}
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
@@ -1149,7 +1170,15 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     index_job_t *job = &g_index_jobs[slot];
     snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
-    snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
+    if (project_name[0]) {
+        snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
+    } else {
+        /* Derive the name the worker will use so layout_project_indexing can
+         * match layout requests against this job while it runs. */
+        char *derived = cbm_project_name_from_path(rpath);
+        snprintf(job->project_name, sizeof(job->project_name), "%s", derived ? derived : "");
+        free(derived);
+    }
     job->error_msg[0] = '\0';
     atomic_store(&job->status, 1);
     yyjson_doc_free(doc);
@@ -1334,7 +1363,8 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    /* 0 = no cap (default). Callers that want a hard cap must opt in. */
+    /* 0 = "no explicit cap" — cbm_layout_compute then applies the render
+     * cap (200k default, CBM_UI_MAX_RENDER_NODES to override / opt out). */
     int max_nodes = 0;
     if (cbm_http_query_param(req->query, "max_nodes", max_str, (int)sizeof(max_str))) {
         int v = atoi(max_str);
@@ -1359,6 +1389,17 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     if (!cbm_file_exists(db_path)) {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
+
+    /* While this server is indexing the project, refuse the (expensive,
+     * immediately-stale) compute instead of queueing it behind the worker.
+     * The client retries after the suggested delay. */
+    if (layout_project_indexing(project)) {
+        char hdrs[600];
+        snprintf(hdrs, sizeof(hdrs), "%sRetry-After: 10\r\n", g_cors_json);
+        cbm_http_reply_buf(c, 503, hdrs, "{\"error\":\"project is being indexed\"}",
+                           strlen("{\"error\":\"project is being indexed\"}"));
         return;
     }
 
@@ -1581,8 +1622,16 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
  * cached; the JSON /api/layout endpoint stays uncached. */
 
 #define LAYOUT_CACHE_SLOTS 4
-/* Sanity gate: blobs above this are served but never cached. */
+/* Hard per-blob ceiling: blobs above this are served but never cached.
+ * Additionally scaled to the process memory budget at runtime — see
+ * layout_cache_blob_limit / layout_cache_total_limit. */
 #define LAYOUT_CACHE_MAX_BLOB ((size_t)512 * 1024 * 1024)
+/* A DB written to within this many seconds is treated as "in churn": a
+ * stale cached blob is served instead of recomputing, so an in-flight
+ * (external) index run can't trigger a fresh multi-GB layout compute per
+ * poll. Self-heals: once writes stop, the next request past the window
+ * recomputes. */
+#define LAYOUT_CACHE_CHURN_SECS 5
 
 typedef struct {
     bool present; /* stat() succeeded at fill time */
@@ -1602,6 +1651,33 @@ typedef struct {
 
 static layout_cache_entry_t g_layout_cache[LAYOUT_CACHE_SLOTS];
 static uint64_t g_layout_cache_clock = 0;
+static size_t g_layout_cache_total = 0; /* bytes across all cached blobs */
+
+/* Cache limits scale with the process memory budget so four kernel-sized
+ * blobs can't pin gigabytes on a small host: per-blob min(512MB, budget/8),
+ * total across slots min(4*512MB, budget/4). Budget 0 (unset, e.g. tests)
+ * falls back to the fixed ceilings. */
+static size_t layout_cache_blob_limit(void) {
+    size_t lim = LAYOUT_CACHE_MAX_BLOB;
+    size_t budget = cbm_mem_budget();
+    if (budget > 0 && budget / 8 < lim)
+        lim = budget / 8;
+    return lim;
+}
+
+static size_t layout_cache_total_limit(void) {
+    size_t lim = (size_t)LAYOUT_CACHE_SLOTS * LAYOUT_CACHE_MAX_BLOB;
+    size_t budget = cbm_mem_budget();
+    if (budget > 0 && budget / 4 < lim)
+        lim = budget / 4;
+    return lim;
+}
+
+static void layout_cache_drop(layout_cache_entry_t *ent) {
+    g_layout_cache_total -= ent->blob_size;
+    free(ent->blob);
+    memset(ent, 0, sizeof(*ent));
+}
 
 /* Snapshot mtime+size of one file; an absent file is a valid state. */
 static void layout_cache_stat(const char *path, layout_cache_stat_t *out) {
@@ -1698,6 +1774,11 @@ static void handle_layout_binary(cbm_http_conn_t *c, const cbm_http_req_t *req) 
     layout_cache_stat(db_path, &db_st);
     layout_cache_stat(wal_path, &wal_st);
 
+    bool indexing = layout_project_indexing(project);
+    int64_t last_write = db_st.mtime > wal_st.mtime ? db_st.mtime : wal_st.mtime;
+    int64_t now = (int64_t)time(NULL);
+    bool churning = last_write > 0 && now >= last_write && now - last_write < LAYOUT_CACHE_CHURN_SECS;
+
     for (int i = 0; i < LAYOUT_CACHE_SLOTS; i++) {
         layout_cache_entry_t *ent = &g_layout_cache[i];
         if (ent->key[0] == '\0' || strcmp(ent->key, key) != 0)
@@ -1708,10 +1789,35 @@ static void handle_layout_binary(cbm_http_conn_t *c, const cbm_http_req_t *req) 
             layout_binary_send(c, req, ent->blob, ent->blob_size, ent->etag);
             return;
         }
-        /* Stale — drop the entry and recompute below. */
-        free(ent->blob);
-        memset(ent, 0, sizeof(*ent));
+        /* Stale. While the DB is being written to (a UI index job, or an
+         * external index/watcher run detected via recent mtime), serve the
+         * stale blob rather than recompute — the result would be obsolete
+         * before it finished, and at 1M+ nodes each compute is GBs of heap
+         * and minutes of CPU queued on this single-threaded server. */
+        if (indexing || churning) {
+            cbm_log_info("layout.cache.stale_serve", "project", project, "reason",
+                         indexing ? "indexing" : "db_churn");
+            ent->last_use = ++g_layout_cache_clock;
+            layout_binary_send(c, req, ent->blob, ent->blob_size, ent->etag);
+            return;
+        }
+        /* Quiet DB — drop the entry and recompute below. */
+        layout_cache_drop(ent);
         break;
+    }
+
+    /* No cached blob to fall back on: while this server's own index job is
+     * running, refuse the compute instead of queueing it behind the worker
+     * (the client retries; the overview payload is small enough that the
+     * first fetch after indexing completes stays snappy). External churn
+     * without a cache entry still computes — first-open after an index
+     * must work. */
+    if (indexing) {
+        char hdrs[600];
+        snprintf(hdrs, sizeof(hdrs), "%sRetry-After: 10\r\n", g_cors_json);
+        cbm_http_reply_buf(c, 503, hdrs, "{\"error\":\"project is being indexed\"}",
+                           strlen("{\"error\":\"project is being indexed\"}"));
+        return;
     }
 
     cbm_store_t *store = cbm_store_open_path(db_path);
@@ -1742,10 +1848,24 @@ static void handle_layout_binary(cbm_http_conn_t *c, const cbm_http_req_t *req) 
     layout_cache_etag(blob, blob_size, etag, sizeof(etag));
 
     /* Store a copy (the cache owns its blob). Oversized blobs are served
-     * but never cached. The stats were taken BEFORE the compute, so a DB
-     * that changed mid-compute stats differently on the next lookup and
+     * but never cached; the per-blob and total limits scale with the
+     * process memory budget. The stats were taken BEFORE the compute, so a
+     * DB that changed mid-compute stats differently on the next lookup and
      * the entry is treated as stale — conservative and correct. */
-    if (blob_size <= LAYOUT_CACHE_MAX_BLOB) {
+    if (blob_size <= layout_cache_blob_limit()) {
+        /* Evict LRU entries until the new blob fits the total budget. */
+        while (g_layout_cache_total + blob_size > layout_cache_total_limit()) {
+            layout_cache_entry_t *lru = NULL;
+            for (int i = 0; i < LAYOUT_CACHE_SLOTS; i++) {
+                if (g_layout_cache[i].key[0] == '\0')
+                    continue;
+                if (!lru || g_layout_cache[i].last_use < lru->last_use)
+                    lru = &g_layout_cache[i];
+            }
+            if (!lru)
+                break; /* cache already empty — blob simply isn't cached */
+            layout_cache_drop(lru);
+        }
         layout_cache_entry_t *slot = NULL;
         for (int i = 0; i < LAYOUT_CACHE_SLOTS; i++) {
             if (g_layout_cache[i].key[0] == '\0') {
@@ -1759,19 +1879,21 @@ static void handle_layout_binary(cbm_http_conn_t *c, const cbm_http_req_t *req) 
                 if (g_layout_cache[i].last_use < slot->last_use)
                     slot = &g_layout_cache[i];
             }
-            free(slot->blob); /* evict LRU entry's blob */
-            memset(slot, 0, sizeof(*slot));
+            layout_cache_drop(slot); /* evict LRU entry's blob */
         }
-        void *copy = malloc(blob_size);
-        if (copy) {
-            memcpy(copy, blob, blob_size);
-            snprintf(slot->key, sizeof(slot->key), "%s", key);
-            slot->blob = copy;
-            slot->blob_size = blob_size;
-            snprintf(slot->etag, sizeof(slot->etag), "%s", etag);
-            slot->db_st = db_st;
-            slot->wal_st = wal_st;
-            slot->last_use = ++g_layout_cache_clock;
+        if (g_layout_cache_total + blob_size <= layout_cache_total_limit()) {
+            void *copy = malloc(blob_size);
+            if (copy) {
+                memcpy(copy, blob, blob_size);
+                snprintf(slot->key, sizeof(slot->key), "%s", key);
+                slot->blob = copy;
+                slot->blob_size = blob_size;
+                g_layout_cache_total += blob_size;
+                snprintf(slot->etag, sizeof(slot->etag), "%s", etag);
+                slot->db_st = db_st;
+                slot->wal_st = wal_st;
+                slot->last_use = ++g_layout_cache_clock;
+            }
         }
     }
 
